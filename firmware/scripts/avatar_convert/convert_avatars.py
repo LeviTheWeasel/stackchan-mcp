@@ -3,6 +3,7 @@
 
 Source (faces, Phase 1):
     ~/.stackchan/avatar/{idle,happy,thinking,sad,surprised,embarrassed}.png
+    ~/.stackchan/avatar/{sleep,yawn,doze}.png
 Source (eyes/mouths, Phase 2):
     ~/.stackchan/avatar/{eyes_open,eyes_half,eyes_closed}.png
     ~/.stackchan/avatar/{mouth_closed,mouth_half,mouth_open,mouth_e,mouth_u}.png
@@ -14,10 +15,10 @@ Why RGB565 fixed binary instead of PNG:
     LVGL cannot decode PNGs at runtime. We must ship raw lv_image_dsc_t arrays.
 
 Why downscale to 160x120:
-  - Original 320x240 RGB565 = 153,600 bytes/frame * 14 = ~2.1 MB.
+  - Original 320x240 RGB565 = 153,600 bytes/frame * 17 = ~2.6 MB.
   - The active OTA partition is 0x3F0000 (~3.9 MB), shared with the application
-    binary. 2.1 MB of constant data would overwhelm the OTA slot.
-  - 160x120 RGB565 = 38,400 bytes/frame * 14 = ~525 KB. Acceptable, and the
+    binary. 2.6 MB of constant data would overwhelm the OTA slot.
+  - 160x120 RGB565 = 38,400 bytes/frame * 17 = ~638 KB. Acceptable, and the
     image is later upscaled by LVGL via lv_image_set_scale() so it fills most
     of the 320x240 LCD without per-pixel resampling cost on flash.
 
@@ -38,7 +39,17 @@ import argparse
 import sys
 from pathlib import Path
 
-EMOTIONS = ["idle", "happy", "thinking", "sad", "surprised", "embarrassed"]
+EMOTIONS = [
+    "idle",
+    "happy",
+    "thinking",
+    "sad",
+    "surprised",
+    "embarrassed",
+    "sleep",
+    "yawn",
+    "doze",
+]
 # Phase 2 part assets. Variable names in the generated C use the *full*
 # source name (e.g. "avatar_eyes_open", "avatar_mouth_e") so the firmware
 # look-up keys stay 1:1 with the PNG filenames.
