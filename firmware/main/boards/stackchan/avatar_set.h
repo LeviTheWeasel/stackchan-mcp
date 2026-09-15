@@ -24,14 +24,14 @@
 class AvatarSet {
 public:
     enum class Mode : uint8_t {
-        kLayered = 0,  // 14 symbols (face 6 + eyes 3 + mouth 5)
-        kMatrix  = 1,  // 90 symbols (face 6 × eyes 3 × mouth 5)
+        kLayered = 0,  // 17 symbols (face 9 + eyes 3 + mouth 5)
+        kMatrix  = 1,  // 135 symbols (face 9 × eyes 3 × mouth 5)
     };
 
     static constexpr int kNumFaces  = 9;  // idle / happy / thinking / sad / surprised / embarrassed / sleep / yawn / doze
     static constexpr int kNumEyes   = 3;  // open / half / closed
     static constexpr int kNumMouths = 5;  // closed / half / open / e / u
-    static constexpr int kMatrixSize = kNumFaces * kNumEyes * kNumMouths;  // 90
+    static constexpr int kMatrixSize = kNumFaces * kNumEyes * kNumMouths;  // 135
 
     // Fixed geometry — matches firmware/scripts/avatar_convert/convert_avatars.py
     // (TARGET_W / TARGET_H) and the LVGL scale already applied in stackchan.cc.
@@ -42,9 +42,9 @@ public:
 
     // Expected raw payload sizes (for early size checks at the loader boundary).
     static constexpr size_t kLayeredPayloadBytes =
-        static_cast<size_t>(kNumFaces + kNumEyes + kNumMouths) * kImageBytes;   // 14 * 38400
+        static_cast<size_t>(kNumFaces + kNumEyes + kNumMouths) * kImageBytes;   // 17 * 38400
     static constexpr size_t kMatrixPayloadBytes =
-        static_cast<size_t>(kMatrixSize) * kImageBytes;                          // 90 * 38400
+        static_cast<size_t>(kMatrixSize) * kImageBytes;                          // 135 * 38400
 
     AvatarSet();
     ~AvatarSet();
@@ -68,7 +68,7 @@ public:
     // Adopt an externally-allocated PSRAM buffer as the new avatar set.
     //
     // Layered layout:
-    //   [0 ..)                                      face   × 6
+    //   [0 ..)                                      face   × 9
     //   [kNumFaces * kImageBytes ..)                eyes   × 3
     //   [(kNumFaces + kNumEyes) * kImageBytes ..)   mouth  × 5
     //   total = kLayeredPayloadBytes

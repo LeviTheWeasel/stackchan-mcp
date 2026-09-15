@@ -2,7 +2,7 @@
 // Replace with real 160×120 RGB565 art before shipping to production.
 //
 // Fix for issue #9: was 2.73 MB (14 symbols × ~38400 bytes of 0x00 text).
-// Now: 14 symbols × 2 bytes = 28 bytes of data, ~1 KB total file.
+// Now: 17 symbols × 2 bytes = 34 bytes of data, ~1 KB total file.
 //
 // Each lv_image_dsc_t is a 1×1 black RGB565 pixel.
 // LVGL renders a single black pixel; device boots without crashing.

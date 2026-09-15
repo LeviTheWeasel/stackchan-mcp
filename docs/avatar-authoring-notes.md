@@ -2,8 +2,8 @@
 
 Field notes from building custom avatar sets for the `load_avatar_set`
 pipeline. The wire format is documented on the tool itself (layered mode =
-14 frames, face 6 + eyes 3 + mouth 5, 537,600 bytes; matrix mode = 90
-pre-composited frames, 6 × 3 × 5, 3,456,000 bytes; both raw RGB565).
+17 frames, face 9 + eyes 3 + mouth 5, 652,800 bytes; matrix mode = 135
+pre-composited frames, 9 × 3 × 5, 5,184,000 bytes; both raw RGB565).
 These notes cover the authoring side: what makes a set read well on the
 device, and the pitfalls we hit so you do not have to.
 
@@ -14,7 +14,7 @@ gateway or the firmware.
 
 A matrix set is the cartesian product of face × eyes × mouth variants.
 The device cuts between those frames constantly (blink, lip-sync,
-expression changes), so all 90 frames must share one geometry: same
+expression changes), so all 135 frames must share one geometry: same
 canvas, same head position, same feature anchor points. A variant that
 is redrawn even slightly off — a face a few pixels larger, an eye line
 a few pixels higher — reads as a visible jump every time that frame is
