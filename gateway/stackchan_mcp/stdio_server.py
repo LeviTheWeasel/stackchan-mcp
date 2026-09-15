@@ -1784,11 +1784,14 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                                 "sad",
                                 "surprised",
                                 "embarrassed",
+                                "sleep",
+                                "yawn",
+                                "doze",
                                 "off",
                             ],
                             "description": (
                                 "One of: idle, happy, thinking, sad, surprised, "
-                                "embarrassed, off."
+                                "embarrassed, sleep, yawn, doze, off."
                             ),
                         },
                     },
