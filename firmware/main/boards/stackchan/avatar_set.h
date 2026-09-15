@@ -28,7 +28,7 @@ public:
         kMatrix  = 1,  // 90 symbols (face 6 × eyes 3 × mouth 5)
     };
 
-    static constexpr int kNumFaces  = 6;  // idle / happy / thinking / sad / surprised / embarrassed
+    static constexpr int kNumFaces  = 9;  // idle / happy / thinking / sad / surprised / embarrassed / sleep / yawn / doze
     static constexpr int kNumEyes   = 3;  // open / half / closed
     static constexpr int kNumMouths = 5;  // closed / half / open / e / u
     static constexpr int kMatrixSize = kNumFaces * kNumEyes * kNumMouths;  // 90

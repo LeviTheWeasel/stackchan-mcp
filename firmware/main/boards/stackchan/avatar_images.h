@@ -14,6 +14,9 @@ extern const lv_image_dsc_t avatar_thinking;
 extern const lv_image_dsc_t avatar_sad;
 extern const lv_image_dsc_t avatar_surprised;
 extern const lv_image_dsc_t avatar_embarrassed;
+extern const lv_image_dsc_t avatar_sleep;
+extern const lv_image_dsc_t avatar_yawn;
+extern const lv_image_dsc_t avatar_doze;
 
 // Phase 2: eye states (full-frame swap)
 extern const lv_image_dsc_t avatar_eyes_open;

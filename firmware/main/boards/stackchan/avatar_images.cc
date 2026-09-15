@@ -89,6 +89,45 @@ const lv_image_dsc_t avatar_embarrassed = {
     .data      = _avatar_embarrassed_data,
 };
 
+static const uint8_t _avatar_sleep_data[] = {0x00, 0x00};
+const lv_image_dsc_t avatar_sleep = {
+    .header = {
+        .cf          = LV_COLOR_FORMAT_RGB565,
+        .flags       = 0,
+        .w           = 1,
+        .h           = 1,
+        .stride      = 2,
+    },
+    .data_size = 2,
+    .data      = _avatar_sleep_data,
+};
+
+static const uint8_t _avatar_yawn_data[] = {0x00, 0x00};
+const lv_image_dsc_t avatar_yawn = {
+    .header = {
+        .cf          = LV_COLOR_FORMAT_RGB565,
+        .flags       = 0,
+        .w           = 1,
+        .h           = 1,
+        .stride      = 2,
+    },
+    .data_size = 2,
+    .data      = _avatar_yawn_data,
+};
+
+static const uint8_t _avatar_doze_data[] = {0x00, 0x00};
+const lv_image_dsc_t avatar_doze = {
+    .header = {
+        .cf          = LV_COLOR_FORMAT_RGB565,
+        .flags       = 0,
+        .w           = 1,
+        .h           = 1,
+        .stride      = 2,
+    },
+    .data_size = 2,
+    .data      = _avatar_doze_data,
+};
+
 // ─── Phase 2: eye states ──────────────────────────────────────────────────────
 
 static const uint8_t _avatar_eyes_open_data[] = {0x00, 0x00};
