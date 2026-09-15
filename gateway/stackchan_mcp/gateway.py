@@ -256,10 +256,21 @@ class Gateway:
         with open(archive_path, "rb") as f:
             payload = f.read()
 
+        # These must track firmware/main/boards/stackchan/avatar_set.h:
+        # kImageWidth / kImageHeight / kNumFaces / kNumEyes / kNumMouths.
+        # AvatarSet::AdoptOwnedBuffer() rejects any payload whose size does
+        # not match kLayeredPayloadBytes / kMatrixPayloadBytes exactly, so a
+        # drift here means every load_avatar_set fails on the device side
+        # after a full HTTP round trip.
         kimg_bytes = 160 * 120 * 2  # 38_400 — matches AvatarSet::kImageBytes
+        num_faces = 9   # AvatarSet::kNumFaces
+        num_eyes = 3    # AvatarSet::kNumEyes
+        num_mouths = 5  # AvatarSet::kNumMouths
         expected = {
-            "layered": 14 * kimg_bytes,   # 537_600
-            "matrix":  90 * kimg_bytes,   # 3_456_000
+            # kLayeredPayloadBytes = (9 + 3 + 5) * 38_400 = 652_800
+            "layered": (num_faces + num_eyes + num_mouths) * kimg_bytes,
+            # kMatrixPayloadBytes = (9 * 3 * 5) * 38_400 = 5_184_000
+            "matrix": (num_faces * num_eyes * num_mouths) * kimg_bytes,
         }.get(mode)
         if expected is None:
             return {"ok": False, "error": f"unknown_mode: {mode}"}
