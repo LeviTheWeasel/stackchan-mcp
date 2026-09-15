@@ -2838,10 +2838,14 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                     "WebSocket, and the device fetches + SHA256-verifies + "
                     "loads it into PSRAM. ``archive_path`` must point to a "
                     "raw RGB565 file on the gateway host: layered mode = "
-                    "14 frames (face 6 + eyes 3 + mouth 5) totalling "
-                    "537,600 bytes; matrix mode = 90 frames (6 × 3 × 5) "
-                    "totalling 3,456,000 bytes. Returns ok / checksum / "
-                    "bytes_transferred / error."
+                    "17 frames (face 9 + eyes 3 + mouth 5) totalling "
+                    "652,800 bytes; matrix mode = 135 frames (9 × 3 × 5) "
+                    "totalling 5,184,000 bytes. Note that matrix mode now "
+                    "needs a single ~5.18 MB PSRAM allocation on the "
+                    "device, on top of the currently loaded set — prefer "
+                    "layered mode unless pre-composited frames are "
+                    "required. Returns ok / checksum / bytes_transferred / "
+                    "error."
                 ),
                 inputSchema={
                     "type": "object",
@@ -2857,8 +2861,8 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                             "type": "string",
                             "enum": ["layered", "matrix"],
                             "description": (
-                                "'layered' (14 frames, ~525 KB) or "
-                                "'matrix' (90 frames, ~3.3 MB)."
+                                "'layered' (17 frames, ~653 KB) or "
+                                "'matrix' (135 frames, ~5.18 MB)."
                             ),
                         },
                         "timeout": {
