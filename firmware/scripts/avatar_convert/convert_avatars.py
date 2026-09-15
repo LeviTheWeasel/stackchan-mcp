@@ -168,7 +168,14 @@ def main() -> int:
         nonlocal total_bytes
         p = src_dir / f"{stem}.png"
         if not p.exists():
-            sys.exit(f"missing source: {p}")
+            sys.exit(
+                f"missing source: {p}\n"
+                f"The complete set is required under {src_dir}, one "
+                f"<name>.png each:\n"
+                f"  faces  ({len(EMOTIONS)}): {', '.join(EMOTIONS)}\n"
+                f"  eyes   ({len(EYES)}): {', '.join(EYES)}\n"
+                f"  mouths ({len(MOUTHS)}): {', '.join(MOUTHS)}"
+            )
         im = Image.open(p)
         # Use LANCZOS for crisp downscale; preserve aspect (320:240 == 4:3 == target).
         im = im.resize((args.width, args.height), Image.LANCZOS)
