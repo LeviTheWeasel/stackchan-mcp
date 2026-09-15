@@ -687,7 +687,7 @@ private:
         EYES = 1,
         MOUTH = 2,
     };
-    int current_face_index_ = 0;   // 0..5  (idle / happy / thinking / sad / surprised / embarrassed)
+    int current_face_index_ = 0;   // 0..8  (idle / happy / thinking / sad / surprised / embarrassed / sleep / yawn / doze)
     int current_eyes_index_ = 0;   // 0..2  (open / half / closed) — 0 is the resting state
     int current_mouth_index_ = 0;  // 0..4  (closed / half / open / e / u) — 0 is the resting state
     ActiveLayer active_layer_ = ActiveLayer::FACE;
@@ -4437,6 +4437,9 @@ private:
         if (strcmp(face, "sad") == 0)         return 3;
         if (strcmp(face, "surprised") == 0)   return 4;
         if (strcmp(face, "embarrassed") == 0) return 5;
+        if (strcmp(face, "sleep") == 0)       return 6;
+        if (strcmp(face, "yawn") == 0)        return 7;
+        if (strcmp(face, "doze") == 0)        return 8;
         return -1;
     }
 
@@ -4477,6 +4480,9 @@ private:
             case 3: return &avatar_sad;
             case 4: return &avatar_surprised;
             case 5: return &avatar_embarrassed;
+            case 6: return &avatar_sleep;
+            case 7: return &avatar_yawn;
+            case 8: return &avatar_doze;
             default: return nullptr;
         }
     }
@@ -6136,7 +6142,7 @@ private:
             });
 
         // Set the avatar face (one of: idle, happy, thinking, sad, surprised,
-        // embarrassed, off).
+        // embarrassed, sleep, yawn, doze, off).
         // The image is rendered as a 320x240 overlay on top of the chat UI's
         // emoji_label_ / emoji_image_; LVGL theme/Application emotion updates
         // will keep happening underneath but are visually masked.
@@ -6147,7 +6153,8 @@ private:
         mcp_server.AddTool(
             "self.display.set_avatar",
             "Set the avatar face displayed on the LCD. face must be one of: "
-            "idle, happy, thinking, sad, surprised, embarrassed, off. "
+            "idle, happy, thinking, sad, surprised, embarrassed, sleep, "
+            "yawn, doze, off. "
             "'off' hides the avatar and disables blink so the underlying "
             "xiaozhi-esp32 screens (WiFi config UI, OTA, settings) are "
             "visible; calling set_avatar with another face brings the avatar "
@@ -6173,7 +6180,7 @@ private:
                     cJSON_AddBoolToObject(root, "ok", false);
                     cJSON_AddStringToObject(root, "error",
                         "Unknown face. Allowed: idle, happy, thinking, sad, "
-                        "surprised, embarrassed, off.");
+                        "surprised, embarrassed, sleep, yawn, doze, off.");
                     ESP_LOGW(TAG, "set_avatar rejected: unknown face '%s'", face.c_str());
                     return root;
                 }
