@@ -430,9 +430,11 @@ async def listen_and_transcribe(
                     "beat mode before calling listen()"
                 )
             raise RuntimeError(
-                "audio_stream recording slot is already held "
-                "(device-driven capture in progress); MCP listen() "
-                "declined to avoid clobbering the active buffer"
+                f"audio_stream recording slot is already held (owner={owner}); "
+                "MCP listen() declined to avoid clobbering the active buffer. "
+                "If a conversation is running, stop it with "
+                "agents_converse_stop; otherwise a device-driven capture is in "
+                "progress."
             )
 
         primary_exc: BaseException | None = None
