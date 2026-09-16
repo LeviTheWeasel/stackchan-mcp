@@ -465,9 +465,26 @@ def test_bypass_tools_include_status_and_follow_pose_stream() -> None:
     assert "stackchan_follow_pose_stream" in BYPASS_TOOLS
 
 
+def test_conversation_teardown_bypasses_the_disconnected_device_gate() -> None:
+    # A dropped device is precisely when the stop must still work: the
+    # conversation holds an open socket to a metered service, and this
+    # transport offers no other way to close it.
+    assert "agents_converse_stop" in BYPASS_TOOLS
+    assert "agents_converse_status" in BYPASS_TOOLS
+    # Starting one genuinely needs the device, so it must stay gated.
+    assert "agents_converse_start" not in BYPASS_TOOLS
+
+
 @pytest.mark.asyncio
 async def test_bypass_tool_get_status_does_not_enter_dispatcher() -> None:
-    assert BYPASS_TOOLS == frozenset({"get_status", "stackchan_follow_pose_stream"})
+    assert BYPASS_TOOLS == frozenset(
+        {
+            "get_status",
+            "stackchan_follow_pose_stream",
+            "agents_converse_stop",
+            "agents_converse_status",
+        }
+    )
     queue = CommandQueue(capacity=2)
 
     async def dispatch(_item: QueueItem):

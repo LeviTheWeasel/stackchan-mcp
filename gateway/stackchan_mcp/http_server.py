@@ -36,7 +36,21 @@ from .stdio_server import _dispatch_mcp_tool, create_server
 
 # Follower lifecycle operations must remain callable when the ESP32 is
 # disconnected so HTTP clients can supervise the background task.
-BYPASS_TOOLS = frozenset({"get_status", "stackchan_follow_pose_stream"})
+#
+# The conversation teardown/inspection pair is here for the same reason,
+# and one sharper one: a conversation owns an open socket to a metered
+# third-party service. If the device drops mid-call — which is exactly
+# when the gate would otherwise engage — gating the stop would leave that
+# socket running with no way to close it over this transport. Starting a
+# conversation still requires a device and is deliberately not listed.
+BYPASS_TOOLS = frozenset(
+    {
+        "get_status",
+        "stackchan_follow_pose_stream",
+        "agents_converse_stop",
+        "agents_converse_status",
+    }
+)
 MCP_HTTP_ALLOWED_HOSTS_ENV = "MCP_HTTP_ALLOWED_HOSTS"
 AUTH_FAILURE_MESSAGE = "Unauthorized: missing or invalid bearer token"
 HOST_FAILURE_MESSAGE = "Forbidden: invalid Host header"
