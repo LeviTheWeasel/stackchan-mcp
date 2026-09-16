@@ -773,6 +773,31 @@ async def _handle_beat_mode_stop() -> list[TextContent]:
     return _follow_pose_text({"ok": True, **status})
 
 
+async def _handle_agents_converse_start(
+    gateway: Gateway,
+    arguments: dict[str, Any],
+) -> list[TextContent]:
+    from .agents_mode import start_agents_conversation
+
+    status = await start_agents_conversation(
+        gateway, agent_id=arguments.get("agent_id")
+    )
+    return _follow_pose_text({"ok": True, **status})
+
+
+async def _handle_agents_converse_stop() -> list[TextContent]:
+    from .agents_mode import stop_agents_conversation
+
+    status = await stop_agents_conversation()
+    return _follow_pose_text({"ok": True, **status})
+
+
+def _handle_agents_converse_status() -> list[TextContent]:
+    from .agents_mode import get_agents_conversation_snapshot
+
+    return _follow_pose_text({"ok": True, **get_agents_conversation_snapshot()})
+
+
 async def _handle_beat_mode_update(arguments: dict[str, Any]) -> list[TextContent]:
     from .beat import update_beat_mode
 
@@ -908,6 +933,15 @@ async def _dispatch_mcp_tool(
 
     if name == "beat_mode_stop":
         return await _handle_beat_mode_stop()
+
+    if name == "agents_converse_start":
+        return await _handle_agents_converse_start(gateway, arguments)
+
+    if name == "agents_converse_stop":
+        return await _handle_agents_converse_stop()
+
+    if name == "agents_converse_status":
+        return _handle_agents_converse_status()
 
     if name == "beat_mode_update":
         return await _handle_beat_mode_update(arguments)
@@ -2557,6 +2591,58 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                     "Stop beat mode, send listen.stop best-effort, and keep "
                     "the last rolling audio buffer available for beat_clip_save "
                     "until the next beat mode start or gateway restart."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="agents_converse_start",
+                description=(
+                    "Start a hands-free, full-duplex conversation between the "
+                    "device and an ElevenLabs Agents agent. Unlike listen(), "
+                    "which captures a fixed window and needs the caller to "
+                    "decide when the user stopped talking, the agent does "
+                    "VAD-based turn detection and interruption handling "
+                    "itself: the mic stays open for the whole session, speech "
+                    "streams up as it is spoken, and replies stream back to "
+                    "the speaker as they are generated. The agent's own LLM "
+                    "produces the replies, so this tool neither sees nor "
+                    "controls what is said. Holds the device microphone until "
+                    "agents_converse_stop, so listen() and beat mode are "
+                    "unavailable meanwhile. Requires ELEVENLABS_API_KEY (or "
+                    "STACKCHAN_ELEVENLABS_KEY) in the gateway environment, and "
+                    "an agent configured for pcm_16000 audio in both "
+                    "directions."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {
+                            "type": "string",
+                            "description": (
+                                "ElevenLabs agent id. Defaults to "
+                                "STACKCHAN_ELEVEN_AGENT_ID in the gateway "
+                                "environment."
+                            ),
+                        },
+                    },
+                },
+            ),
+            Tool(
+                name="agents_converse_stop",
+                description=(
+                    "End the active ElevenLabs conversation: close the agent "
+                    "socket, release the microphone, and send listen.stop "
+                    "best-effort. Returns the final session counters."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="agents_converse_status",
+                description=(
+                    "Report the active ElevenLabs conversation: whether one is "
+                    "running, its conversation id, uplink/playback counters, "
+                    "interruption count, and the last user transcript and "
+                    "agent reply seen. Read-only."
                 ),
                 inputSchema={"type": "object", "properties": {}},
             ),
