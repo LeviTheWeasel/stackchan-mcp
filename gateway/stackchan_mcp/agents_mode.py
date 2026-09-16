@@ -16,7 +16,16 @@ Wire shape, per the ElevenLabs Agents WebSocket protocol:
 
     gateway -> agent   {"user_audio_chunk": "<base64 pcm16>"}
     agent -> gateway   audio / interruption / ping / user_transcript /
-                       agent_response / conversation_initiation_metadata
+                       agent_response / agent_response_complete /
+                       conversation_initiation_metadata
+
+End-of-turn is the one part of that protocol we cannot rely on: the audio
+event's ``is_final`` is optional and defaults to false, and
+``agent_response_complete`` is not guaranteed either. So a turn is closed
+by whichever of the two arrives first, and failing both, by
+:data:`TURN_IDLE_TIMEOUT_S`. A turn that never closes is not a cosmetic
+bug -- the device stays in its speaking state, which mutes its own
+microphone, so the conversation dies silently with counters at zero.
 
 The device speaks Opus at :data:`DEVICE_SAMPLE_RATE`; the agent is
 configured for ``pcm_16000`` in both directions, so the only conversion
@@ -64,9 +73,23 @@ REQUIRED_AUDIO_FORMAT = f"pcm_{DEVICE_SAMPLE_RATE}"
 UPLINK_QUEUE_MAX_FRAMES = 200
 
 #: Decoded agent audio waiting for the speaker. The sentinel ``None``
-#: marks end-of-turn (``is_final``), which closes one ``send_pcm_stream``
-#: call so the device leaves the speaking state between turns.
+#: marks end-of-turn, which closes one ``send_pcm_stream`` call so the
+#: device leaves the speaking state between turns.
 PLAYBACK_QUEUE_MAX_CHUNKS = 400
+
+#: How long a turn may go without new audio before we close it ourselves.
+#: End-of-turn is advisory on the wire: ``is_final`` is optional and
+#: defaults to false, and ``agent_response_complete`` may be the only
+#: signal we get -- or neither may arrive. Without a bound here a turn
+#: that is never closed wedges the whole mode: ``send_pcm_stream`` never
+#: returns, so the device stays in the speaking state (mouth animating,
+#: mic muted) and ``stop`` has a task it cannot join.
+TURN_IDLE_TIMEOUT_S = 3.0
+
+#: Upper bound on tearing one conversation down. Cancelling a wedged
+#: playback task must never be able to hang ``stop`` itself, because
+#: ``stop`` holds the module lock and everything else queues behind it.
+STOP_GRACE_S = 5.0
 
 _mode: "AgentsConversation | None" = None
 _mode_lock: asyncio.Lock | None = None
@@ -170,6 +193,8 @@ class AgentsConversation:
         self._audio_chunks_received = 0
         self._interruptions = 0
         self._turns_played = 0
+        self._last_turn_end_reason: str | None = None
+        self._unlogged_event_kinds: set[str] = set()
 
     @property
     def active(self) -> bool:
@@ -186,6 +211,7 @@ class AgentsConversation:
             "audio_chunks_received": self._audio_chunks_received,
             "interruptions": self._interruptions,
             "turns_played": self._turns_played,
+            "last_turn_end_reason": self._last_turn_end_reason,
             "last_user_transcript": self._last_user_transcript,
             "last_agent_response": self._last_agent_response,
             "last_error": self._last_error,
@@ -304,9 +330,12 @@ class AgentsConversation:
 
             for task in self._tasks:
                 task.cancel()
-            for task in self._tasks:
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
+            if self._tasks:
+                # Bounded join, and a task that refuses to die is abandoned
+                # rather than awaited: ``stop`` runs under the module lock,
+                # so hanging here freezes every later call -- which is the
+                # exact failure this replaces.
+                await asyncio.wait(self._tasks, timeout=STOP_GRACE_S)
             self._tasks = []
             await self._cancel_playback()
 
@@ -389,7 +418,7 @@ class AgentsConversation:
                 self._audio_chunks_received += 1
                 await self._enqueue_playback(base64.b64decode(b64))
             if audio.get("is_final"):
-                await self._enqueue_playback(None)
+                await self._close_turn("is_final")
             return
 
         if kind == "interruption":
@@ -425,9 +454,29 @@ class AgentsConversation:
             ).get("corrected_agent_response")
             return
 
+        if kind == "agent_response_complete":
+            # The far side's explicit "that reply is finished" signal, and
+            # the only end-of-turn marker we get when the audio events
+            # never carry ``is_final`` (it is optional, default false).
+            await self._close_turn("agent_response_complete")
+            return
+
         if kind == "client_error" or kind == "error":
             self._last_error = json.dumps(event)[:300]
             logger.warning("agents error event: %s", self._last_error)
+            return
+
+        # Anything we do not handle is logged once per kind. End-of-turn
+        # on this protocol is advisory, so when a turn misbehaves the
+        # first question is always "what did the far side actually send?"
+        if isinstance(kind, str) and kind not in self._unlogged_event_kinds:
+            self._unlogged_event_kinds.add(kind)
+            logger.info("agents event kind not handled: %s", kind)
+
+    async def _close_turn(self, reason: str) -> None:
+        """Queue the sentinel that ends one ``send_pcm_stream`` call."""
+        self._last_turn_end_reason = reason
+        await self._enqueue_playback(None)
 
     async def _enqueue_playback(self, chunk: bytes | None) -> None:
         try:
@@ -448,8 +497,10 @@ class AgentsConversation:
         if task is None or task.done():
             return
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
+        # Bounded join: a playback task blocked on device I/O must not be
+        # able to hold teardown open. ``asyncio.wait`` returns on timeout
+        # instead of waiting for the cancellation itself to land.
+        await asyncio.wait({task}, timeout=STOP_GRACE_S)
 
     async def _playback_loop(self) -> None:
         """Play one agent turn per ``send_pcm_stream`` call.
@@ -474,7 +525,21 @@ class AgentsConversation:
         async def chunks():
             yield first_chunk
             while True:
-                chunk = await self._playback_queue.get()
+                try:
+                    chunk = await asyncio.wait_for(
+                        self._playback_queue.get(), TURN_IDLE_TIMEOUT_S
+                    )
+                except asyncio.TimeoutError:
+                    # No more audio and no end-of-turn marker ever came.
+                    # Close the turn regardless: leaving it open keeps the
+                    # device speaking forever, which mutes its own mic.
+                    self._last_turn_end_reason = "idle_timeout"
+                    logger.warning(
+                        "agents turn closed by idle timeout after %.1fs "
+                        "with no end-of-turn marker",
+                        TURN_IDLE_TIMEOUT_S,
+                    )
+                    return
                 if chunk is None:
                     return
                 yield chunk

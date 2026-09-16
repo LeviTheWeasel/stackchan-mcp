@@ -125,6 +125,90 @@ async def test_audio_event_is_queued_and_is_final_closes_the_turn() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_response_complete_closes_the_turn() -> None:
+    """``is_final`` is optional on the wire; this may be the only marker."""
+    conv = _conversation()
+    pcm = b"\x03\x04" * 8
+
+    await conv._handle_event(
+        {
+            "type": "audio",
+            "audio_event": {"audio_base_64": base64.b64encode(pcm).decode()},
+        }
+    )
+    await conv._handle_event(
+        {
+            "type": "agent_response_complete",
+            "agent_response_complete_event": {"event_id": 9},
+        }
+    )
+
+    assert conv._playback_queue.get_nowait() == pcm
+    assert conv._playback_queue.get_nowait() is None
+    assert conv.status()["last_turn_end_reason"] == "agent_response_complete"
+
+
+@pytest.mark.asyncio
+async def test_turn_closes_itself_when_no_end_marker_ever_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn nobody closes must not keep the device speaking forever."""
+    monkeypatch.setattr(agents_mode, "TURN_IDLE_TIMEOUT_S", 0.05)
+
+    played: list[bytes] = []
+
+    async def _fake_send_pcm_stream(_gateway: Any, chunks: Any, **_kwargs: Any) -> None:
+        async for chunk in chunks:
+            played.append(chunk)
+
+    monkeypatch.setattr(agents_mode, "send_pcm_stream", _fake_send_pcm_stream)
+
+    conv = _conversation()
+    await conv._play_turn(b"only-chunk")
+
+    assert played == [b"only-chunk"]
+    assert conv.status()["turns_played"] == 1
+    assert conv.status()["last_turn_end_reason"] == "idle_timeout"
+
+
+@pytest.mark.asyncio
+async def test_stop_gives_up_on_playback_that_ignores_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``stop`` runs under the module lock, so it must never wait forever."""
+    monkeypatch.setattr(agents_mode, "STOP_GRACE_S", 0.05)
+
+    conv = _conversation()
+    conv._ws = _FakeWS()
+    conv._active = True
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _uncancellable() -> None:
+        started.set()
+        while not release.is_set():
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                continue
+
+    stubborn = asyncio.create_task(_uncancellable())
+    conv._playback_task = stubborn
+    conv._tasks = [stubborn]
+    await started.wait()
+
+    try:
+        await asyncio.wait_for(conv.stop(), timeout=2.0)
+    finally:
+        release.set()
+        await stubborn
+
+    assert conv.status()["active"] is False
+    assert not stubborn.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_interruption_drops_queued_audio_and_cancels_playback() -> None:
     conv = _conversation()
     for _ in range(3):
