@@ -84,12 +84,28 @@ PLAYBACK_QUEUE_MAX_CHUNKS = 400
 #: that is never closed wedges the whole mode: ``send_pcm_stream`` never
 #: returns, so the device stays in the speaking state (mouth animating,
 #: mic muted) and ``stop`` has a task it cannot join.
-TURN_IDLE_TIMEOUT_S = 3.0
+#:
+#: Treat the value as dead air, not as a rare safety net. No agent
+#: observed so far ends a turn with a marker, so every reply pays this in
+#: full, and the device is deaf for all of it -- the mic comes back only
+#: once the turn closes. The floor is the far side's inter-chunk gap
+#: (~0.7 s observed, four chunks across a 1.9 s reply): drop below that
+#: and one reply gets chopped into several spoken turns, each with its
+#: own tts handshake.
+TURN_IDLE_TIMEOUT_S = 1.5
 
 #: Upper bound on tearing one conversation down. Cancelling a wedged
 #: playback task must never be able to hang ``stop`` itself, because
 #: ``stop`` holds the module lock and everything else queues behind it.
 STOP_GRACE_S = 5.0
+
+#: How long the farewell may keep playing after the far side hangs up.
+#: ``end_call`` speaks its goodbye and *then* closes the socket, so the
+#: last turn is still in the playback queue when the close lands: tear
+#: down immediately and the agent is cut off mid-sentence. Must clear a
+#: farewell plus the ``TURN_IDLE_TIMEOUT_S`` that closes it, and it only
+#: ever delays releasing a device nobody else is waiting on.
+FAREWELL_GRACE_S = 10.0
 
 _mode: "AgentsConversation | None" = None
 _mode_lock: asyncio.Lock | None = None
@@ -179,6 +195,10 @@ class AgentsConversation:
         self._ws: Any = None
         self._tasks: list[asyncio.Task[None]] = []
         self._playback_task: asyncio.Task[None] | None = None
+        # Deliberately not in ``_tasks``: this one outlives the tasks it
+        # is tearing down, so ``stop`` cancelling ``_tasks`` must not
+        # reach it -- it is the thing calling ``stop``.
+        self._teardown_task: asyncio.Task[None] | None = None
         self._stop_lock = asyncio.Lock()
 
         self._active = False
@@ -193,7 +213,9 @@ class AgentsConversation:
         self._audio_chunks_received = 0
         self._interruptions = 0
         self._turns_played = 0
+        self._listen_rearms = 0
         self._last_turn_end_reason: str | None = None
+        self._ended_reason: str | None = None
         self._unlogged_event_kinds: set[str] = set()
 
     @property
@@ -211,7 +233,16 @@ class AgentsConversation:
             "audio_chunks_received": self._audio_chunks_received,
             "interruptions": self._interruptions,
             "turns_played": self._turns_played,
+            # Should track turns_played once the first reply lands. A
+            # conversation whose uplink dies after the greeting shows
+            # turns climbing while this stays put.
+            "listen_rearms": self._listen_rearms,
             "last_turn_end_reason": self._last_turn_end_reason,
+            # Why the conversation finished: "agent_hangup" when the far
+            # side closed cleanly (the agent's ``end_call``), "far_side_
+            # lost" when the socket died on us, "local_stop" for an
+            # explicit agents_converse_stop. None while still running.
+            "ended_reason": self._ended_reason,
             "last_user_transcript": self._last_user_transcript,
             "last_agent_response": self._last_agent_response,
             "last_error": self._last_error,
@@ -251,12 +282,16 @@ class AgentsConversation:
             )
             await self._await_initiation_metadata()
             self._arm_capture()
-            # profile="voice" (the default) is load-bearing here, not
-            # cosmetic: the mic stays open while the speaker is playing
-            # the agent's reply, which is what makes barge-in possible.
-            # Without the voice profile's echo cancellation the agent
-            # hears its own voice and interrupts itself in a loop.
-            # beat mode uses profile="raw" for the opposite reason.
+            # profile="voice" selects the firmware's speech AFE path, so
+            # the agent hears echo-cancelled speech instead of its own
+            # voice; beat mode uses profile="raw" for the opposite reason.
+            #
+            # It does *not* keep the mic open across playback. Measured
+            # against firmware 2.2.6: the device stops sending frames the
+            # moment it enters the speaking state, and comes back to idle
+            # rather than to listening when the turn ends. So this
+            # listen.start only covers the window before the agent's first
+            # reply -- ``_rearm_listening`` owns every window after it.
             await self._gateway.esp32.send_listen_state(
                 "start", mode="manual", profile="voice"
             )
@@ -327,6 +362,11 @@ class AgentsConversation:
             if not self._active:
                 return self.status()
             self._active = False
+            # Set only when the far side has not already explained itself,
+            # so a hangup keeps its reason instead of every conversation
+            # reporting the teardown call that finished it.
+            if self._ended_reason is None:
+                self._ended_reason = "local_stop"
 
             for task in self._tasks:
                 task.cancel()
@@ -398,8 +438,8 @@ class AgentsConversation:
             try:
                 raw = await self._ws.recv()
             except Exception as exc:
-                self._last_error = f"connection closed: {exc}"
                 logger.info("agents downlink closed: %s", exc)
+                self._note_far_side_hangup(exc)
                 return
             try:
                 event = json.loads(raw)
@@ -502,6 +542,90 @@ class AgentsConversation:
         # instead of waiting for the cancellation itself to land.
         await asyncio.wait({task}, timeout=STOP_GRACE_S)
 
+    def _note_far_side_hangup(self, exc: BaseException) -> None:
+        """React to the conversation socket closing under us.
+
+        There is no "conversation over" event on this protocol: the agent
+        speaks its farewell and the server then closes the socket, so this
+        close *is* the hangup. Nothing else reaps the mode, and without a
+        teardown here the mic stays armed forever -- ``listen()`` and beat
+        mode would refuse to run until the gateway is restarted.
+
+        A close during ``stop`` is our own doing and is ignored: ``stop``
+        clears ``active`` before it touches the socket.
+        """
+        if not self._active or self._teardown_task is not None:
+            return
+        # websockets raises ConnectionClosedOK only for a clean close
+        # handshake, which is what ``end_call`` produces. Anything else
+        # is a drop, and the distinction is the difference between "he
+        # said goodbye" and "the network ate him" when reading status.
+        graceful = type(exc).__name__ == "ConnectionClosedOK"
+        self._ended_reason = "agent_hangup" if graceful else "far_side_lost"
+        if not graceful:
+            self._last_error = f"connection closed: {exc}"
+        logger.info(
+            "agents conversation ended by far side: reason=%s", self._ended_reason
+        )
+        self._teardown_task = asyncio.create_task(
+            self._teardown_after_hangup(), name="agents-hangup-teardown"
+        )
+
+    async def _teardown_after_hangup(self) -> None:
+        """Let the farewell finish, then release the device.
+
+        Routed through the module-level ``stop_agents_conversation`` rather
+        than ``self.stop`` so the global ``_mode`` slot is cleared too: a
+        stale entry would keep reporting a conversation that is long gone.
+        """
+        with contextlib.suppress(Exception):
+            await self._drain_playback(FAREWELL_GRACE_S)
+        with contextlib.suppress(Exception):
+            await stop_agents_conversation()
+
+    async def _drain_playback(self, timeout_s: float) -> None:
+        """Wait until nothing is queued for, or playing on, the speaker."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while loop.time() < deadline:
+            task = self._playback_task
+            if self._playback_queue.empty() and (task is None or task.done()):
+                return
+            await asyncio.sleep(0.05)
+        logger.warning(
+            "agents farewell still playing after %.1fs; releasing the device anyway",
+            timeout_s,
+        )
+
+    async def _rearm_listening(self) -> None:
+        """Put the device back into listening mode after a turn.
+
+        The firmware leaves the listening state when it starts speaking
+        and returns to *idle*, not to listening, once the turn ends. The
+        single ``listen.start`` that :meth:`start` issues therefore only
+        covers the window before the agent's first reply -- about half a
+        second when the agent opens with a greeting. Without re-arming
+        here the uplink goes silent for the rest of the session: the
+        agent talks, the user answers, and nothing is ever heard.
+
+        A failure is logged rather than raised. The outbound direction
+        still works, and letting this kill the playback loop would turn a
+        deaf conversation into a mute one as well.
+        """
+        if not self._active:
+            # ``stop`` clears the flag before it cancels these tasks, so
+            # this keeps teardown from re-opening the mic on its way out.
+            return
+        try:
+            await self._gateway.esp32.send_listen_state(
+                "start", mode="manual", profile="voice"
+            )
+        except Exception as exc:
+            self._last_error = f"listen re-arm failed: {exc}"
+            logger.warning("agents listen re-arm failed: %s", exc)
+            return
+        self._listen_rearms += 1
+
     async def _playback_loop(self) -> None:
         """Play one agent turn per ``send_pcm_stream`` call.
 
@@ -509,6 +633,11 @@ class AgentsConversation:
         stream open) is what lets the device return to idle between
         replies, and gives interruption something to cancel that unwinds
         the tts start/stop handshake cleanly.
+
+        Re-arming the mic is bracketed to the same boundary: this is the
+        one place every turn passes through on its way back to idle,
+        whether it ended on a marker, on the idle timeout, or on an
+        interruption cancelling playback mid-sentence.
         """
         while True:
             first = await self._playback_queue.get()
@@ -520,6 +649,7 @@ class AgentsConversation:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._playback_task
             self._playback_task = None
+            await self._rearm_listening()
 
     async def _play_turn(self, first_chunk: bytes) -> None:
         async def chunks():

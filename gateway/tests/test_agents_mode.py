@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -169,6 +170,209 @@ async def test_turn_closes_itself_when_no_end_marker_ever_arrives(
     assert played == [b"only-chunk"]
     assert conv.status()["turns_played"] == 1
     assert conv.status()["last_turn_end_reason"] == "idle_timeout"
+
+
+async def _wait_until(predicate: Any, timeout_s: float = 2.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while not predicate():
+        if loop.time() > deadline:
+            raise AssertionError("condition was not reached in time")
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_playback_loop_rearms_the_mic_after_every_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The device drops out of listening to speak and returns to idle.
+
+    So the single ``listen.start`` that ``start`` issues covers only the
+    window before the agent's first reply. Miss the re-arm and the user
+    is never heard again for the rest of the conversation.
+    """
+
+    async def _fake_send_pcm_stream(_gateway: Any, chunks: Any, **_kwargs: Any) -> None:
+        async for _chunk in chunks:
+            pass
+
+    monkeypatch.setattr(agents_mode, "send_pcm_stream", _fake_send_pcm_stream)
+
+    gateway = _FakeGateway()
+    conv = _conversation(gateway)
+    conv._active = True
+
+    loop_task = asyncio.create_task(conv._playback_loop())
+    try:
+        for _ in range(2):
+            await conv._enqueue_playback(b"chunk")
+            await conv._close_turn("agent_response_complete")
+        await _wait_until(lambda: conv.status()["listen_rearms"] == 2)
+    finally:
+        loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop_task
+
+    assert conv.status()["turns_played"] == 2
+    # Re-armed with the same profile the conversation opened on: "raw"
+    # here would hand the agent un-cancelled echo of its own voice.
+    assert gateway.esp32.listen_calls == [
+        ("start", "manual", "voice"),
+        ("start", "manual", "voice"),
+    ]
+
+
+class _ConnectionClosedOK(Exception):
+    """Stand-in for the websockets clean-close exception.
+
+    ``_note_far_side_hangup`` matches on the class name so the module
+    keeps its lazy websockets import, so the name here is load-bearing.
+    """
+
+
+_ConnectionClosedOK.__name__ = "ConnectionClosedOK"
+
+
+@pytest.mark.asyncio
+async def test_agent_hangup_releases_the_device_and_clears_the_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``end_call`` closes the socket; nothing else would reap the mode.
+
+    Leaving it armed strands the recording slot, and ``listen()`` and beat
+    mode then refuse to run until the gateway is restarted.
+    """
+    monkeypatch.setattr(agents_mode, "FAREWELL_GRACE_S", 0.2)
+    monkeypatch.setattr(agents_mode, "_mode", None)
+
+    gateway = _FakeGateway()
+    conv = _conversation(gateway)
+    conv._ws = _FakeWS()
+    conv._active = True
+    monkeypatch.setattr(agents_mode, "_mode", conv)
+
+    conv._note_far_side_hangup(_ConnectionClosedOK("1000 (OK)"))
+    assert conv._teardown_task is not None
+    await asyncio.wait_for(conv._teardown_task, timeout=5.0)
+
+    status = conv.status()
+    assert status["ended_reason"] == "agent_hangup"
+    assert status["active"] is False
+    # A clean goodbye is not a failure, and must not be filed as one.
+    assert status["last_error"] is None
+    assert ("stop", "manual", "voice") in gateway.esp32.listen_calls
+    assert agents_mode._mode is None
+
+
+@pytest.mark.asyncio
+async def test_downlink_loop_treats_a_closed_socket_as_a_hangup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The read loop is where the hangup is observed, so it must act on it.
+
+    Returning quietly -- as it used to -- leaves ``active`` set and the
+    microphone held by a conversation that no longer has a far side.
+    """
+    monkeypatch.setattr(agents_mode, "FAREWELL_GRACE_S", 0.2)
+    monkeypatch.setattr(agents_mode, "_mode", None)
+
+    class _ClosingWS(_FakeWS):
+        async def recv(self) -> str:
+            raise _ConnectionClosedOK("1000 (OK)")
+
+    conv = _conversation()
+    conv._ws = _ClosingWS()
+    conv._active = True
+    monkeypatch.setattr(agents_mode, "_mode", conv)
+
+    await conv._downlink_loop()
+
+    assert conv._teardown_task is not None, "closed socket did not trigger teardown"
+    await asyncio.wait_for(conv._teardown_task, timeout=5.0)
+    assert conv.status()["ended_reason"] == "agent_hangup"
+    assert conv.status()["active"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_socket_is_reported_as_a_loss_not_a_hangup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(agents_mode, "FAREWELL_GRACE_S", 0.2)
+    monkeypatch.setattr(agents_mode, "_mode", None)
+
+    conv = _conversation()
+    conv._ws = _FakeWS()
+    conv._active = True
+    monkeypatch.setattr(agents_mode, "_mode", conv)
+
+    conv._note_far_side_hangup(ConnectionError("no close frame"))
+    await asyncio.wait_for(conv._teardown_task, timeout=5.0)
+
+    status = conv.status()
+    assert status["ended_reason"] == "far_side_lost"
+    assert "no close frame" in (status["last_error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_our_own_stop_closing_the_socket_is_not_a_hangup() -> None:
+    """``stop`` clears ``active`` before it closes the socket."""
+    conv = _conversation()
+    conv._active = False
+
+    conv._note_far_side_hangup(_ConnectionClosedOK("1000 (OK)"))
+
+    assert conv._teardown_task is None
+    assert conv.status()["ended_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_teardown_waits_for_the_farewell_to_finish_playing() -> None:
+    """The goodbye is still queued when the close lands: let it play."""
+    conv = _conversation()
+    conv._playback_queue.put_nowait(b"farewell")
+
+    draining = asyncio.create_task(conv._drain_playback(3.0))
+    await asyncio.sleep(0.15)
+    assert not draining.done(), "released the device while the goodbye was queued"
+
+    conv._drain_playback_queue()
+    await asyncio.wait_for(draining, timeout=3.0)
+
+
+@pytest.mark.asyncio
+async def test_rearm_is_skipped_once_the_conversation_is_stopping() -> None:
+    """``stop`` clears ``active`` before it cancels the playback task.
+
+    A re-arm racing that teardown would leave the mic open on a
+    conversation that no longer has anything reading from it.
+    """
+    gateway = _FakeGateway()
+    conv = _conversation(gateway)
+    conv._active = False
+
+    await conv._rearm_listening()
+
+    assert gateway.esp32.listen_calls == []
+    assert conv.status()["listen_rearms"] == 0
+
+
+@pytest.mark.asyncio
+async def test_rearm_failure_is_recorded_rather_than_raised() -> None:
+    """A dropped device must not take the playback loop down with it."""
+    gateway = _FakeGateway()
+
+    async def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise ConnectionError("device went away")
+
+    gateway.esp32.send_listen_state = _boom  # type: ignore[method-assign]
+
+    conv = _conversation(gateway)
+    conv._active = True
+
+    await conv._rearm_listening()
+
+    assert conv.status()["listen_rearms"] == 0
+    assert "listen re-arm failed" in (conv.status()["last_error"] or "")
 
 
 @pytest.mark.asyncio
