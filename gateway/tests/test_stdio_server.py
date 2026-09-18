@@ -1988,3 +1988,145 @@ async def test_follow_led_rejects_bad_color_order(monkeypatch):
     assert captured == []
     assert "Input validation error" in result.root.content[0].text
     assert "'bgr' is not one of ['grb', 'rgb']" in result.root.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_list_tools_includes_charge_tools():
+    """Charge state read/write tools are exposed with expected schemas.
+
+    They exist because the charger is the cause of the phantom head-touches,
+    so the descriptions have to say that -- a reader who only sees "AXP2101
+    register 0x18" has no way to know why the tool is here.
+    """
+    server = create_server()
+
+    result = await server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+
+    tools = {tool.name: tool for tool in result.root.tools}
+    assert "get_charge_state" in tools
+    assert "set_charge_enabled" in tools
+
+    get_tool = tools["get_charge_state"]
+    assert get_tool.inputSchema == {"type": "object", "properties": {}}
+    assert "reg_0x18" in get_tool.description
+    assert "battery_level" in get_tool.description
+    assert "phantom head-touches" in get_tool.description
+
+    set_tool = tools["set_charge_enabled"]
+    assert set_tool.inputSchema == {
+        "type": "object",
+        "properties": {
+            "enabled": {
+                "type": "boolean",
+                "description": (
+                    "True to allow the cell to charge, false to hold "
+                    "it off while leaving the system powered."
+                ),
+            },
+        },
+        "required": ["enabled"],
+    }
+    # The two facts that make the difference between a safe call and a
+    # surprise: the robot stays powered, and the setting does not survive.
+    assert "USB keeps powering the system" in set_tool.description
+    assert "volatile" in set_tool.description
+
+
+@pytest.mark.asyncio
+async def test_get_charge_state_relays_to_esp32(monkeypatch):
+    """get_charge_state maps to the firmware power tool and takes no arguments."""
+    calls = []
+
+    class FakeESP32:
+        device_connected = True
+
+        async def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "charge_enabled": True,
+                                "reg_0x18": 0b00001110,
+                                "charging": True,
+                                "discharging": False,
+                                "charge_done": False,
+                                "battery_level": 100,
+                                "auto_enabled": False,
+                            }
+                        ),
+                    }
+                ],
+            }, None
+
+    class FakeGateway:
+        esp32 = FakeESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: FakeGateway())
+    server = create_server()
+
+    result = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={"name": "get_charge_state", "arguments": {}},
+        )
+    )
+
+    assert calls == [("self.power.get_charge_state", {})]
+    payload = json.loads(result.root.content[0].text)
+    # A full cell that is still being charged is the phantom-touch state.
+    assert payload["battery_level"] == 100
+    assert payload["charging"] is True
+
+
+@pytest.mark.asyncio
+async def test_set_charge_enabled_relays_to_esp32(monkeypatch):
+    """set_charge_enabled passes `enabled` through to the firmware unchanged."""
+    calls = []
+
+    class FakeESP32:
+        device_connected = True
+
+        async def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "ok": True,
+                                "charge_enabled": arguments["enabled"],
+                                "reg_0x18": 0b00001100,
+                                "takes_effect": "immediate",
+                                "persistence": "volatile_resets_on_boot",
+                                "auto_enabled": False,
+                            }
+                        ),
+                    }
+                ],
+            }, None
+
+    class FakeGateway:
+        esp32 = FakeESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: FakeGateway())
+    server = create_server()
+
+    arguments = {"enabled": False}
+    result = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={"name": "set_charge_enabled", "arguments": arguments},
+        )
+    )
+
+    assert calls == [("self.power.set_charge_enabled", arguments)]
+    payload = json.loads(result.root.content[0].text)
+    assert payload["ok"] is True
+    assert payload["charge_enabled"] is False
+    assert payload["persistence"] == "volatile_resets_on_boot"

@@ -1208,6 +1208,14 @@ async def _dispatch_mcp_tool(
             "self.i2c.write_read",
             arguments,
         ),
+        "get_charge_state": (
+            "self.power.get_charge_state",
+            {},
+        ),
+        "set_charge_enabled": (
+            "self.power.set_charge_enabled",
+            arguments,
+        ),
     }
 
     if name not in tool_map:
@@ -2013,6 +2021,57 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                 inputSchema={
                     "type": "object",
                     "properties": {},
+                },
+            ),
+            Tool(
+                name="get_charge_state",
+                description=(
+                    "Read the AXP2101 charge state: charge_enabled and reg_0x18 "
+                    "(bit1 = cell battery charge enable), the charging / "
+                    "discharging / charge_done flags, and battery_level from the "
+                    "fuel gauge. Also reports whether the firmware's automatic "
+                    "charge control is compiled in, its ON/OFF thresholds, and "
+                    "its last decision.\n\n"
+                    "Read this when diagnosing phantom head-touches. A full cell "
+                    "on a charger is topped up in bursts, and the current surge "
+                    "shifts the touch sensor's capacitive baseline enough to "
+                    "report a gesture nobody made -- which is how the robot came "
+                    "to open a conversation with an empty room once an hour. "
+                    "battery_level 100 together with charging true is that state."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+            Tool(
+                name="set_charge_enabled",
+                description=(
+                    "Enable or disable AXP2101 cell battery charging (register "
+                    "0x18 bit1, read-modify-write in firmware, so the fuel gauge "
+                    "and every other bit survive). Takes effect immediately and "
+                    "is read back from the PMIC before returning.\n\n"
+                    "Disabling charging stops current flowing into the cell only. "
+                    "USB keeps powering the system through a separate path, so "
+                    "the robot stays up; this is the way to remove the cause of "
+                    "phantom head-touches rather than filter them downstream. "
+                    "The setting is volatile and returns to the compile-time "
+                    "default on reboot, and if the firmware was built with "
+                    "automatic charge control it may be overwritten by the next "
+                    "automatic decision -- check auto_enabled in the response."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": (
+                                "True to allow the cell to charge, false to hold "
+                                "it off while leaving the system powered."
+                            ),
+                        },
+                    },
+                    "required": ["enabled"],
                 },
             ),
             Tool(
