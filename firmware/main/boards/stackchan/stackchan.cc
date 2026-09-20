@@ -71,8 +71,20 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 // Automatic charge hysteresis. These values may be overridden with compiler
 // -D options. The existing one-second status-bar battery poll drives the
 // decision at a 60-second cadence; no dedicated timer or task is created.
+//
+// On by default here since the 2026-09-18 measurement. A full cell left on the
+// charger tops up in bursts, and each burst shifts the Si12T capacitive
+// baseline enough to emit a phantom stroke: the robot was opening a
+// conversation with an empty room about once an hour. Holding charge off for
+// 23 h 22 min produced zero touch events on a stream that was provably still
+// live, and the phantoms came back with charging. The band keeps the cell away
+// from the 100 % top-up cycle that causes them, and away from the empty end
+// that ended that experiment in a brown-out reboot -- which is also where a
+// lithium cell lasts longest.
+//
+// Build with -DSTACKCHAN_CHARGE_AUTO=0 to restore the pre-feature behaviour.
 #ifndef STACKCHAN_CHARGE_AUTO
-#define STACKCHAN_CHARGE_AUTO 0
+#define STACKCHAN_CHARGE_AUTO 1
 #endif
 
 #ifndef STACKCHAN_CHARGE_ON_BELOW
