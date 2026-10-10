@@ -2,86 +2,136 @@
 
 In an ElevenLabs Agents conversation the far side already knows how to be
 interrupted: it listens while it speaks, and when the guest talks over a reply
-it stops and sends an `interruption` event. Until this change that never
-happened with the robot, because the robot was not sending it anything to hear.
-The firmware switched voice capture off the moment it started speaking and the
-gateway re-armed the microphone after every reply. On a real call that looked
-like this: `interruptions: 0`, `listen_rearms` equal to the number of turns, and
-no user speech transcribed during any reply.
+it stops and sends an `interruption` event. With the robot that never
+happened, because the robot was not sending it anything to hear. The firmware
+switched voice capture off the moment it started speaking and the gateway
+re-armed the microphone after every reply. On a real call that looked like
+this: `interruptions: 0`, `listen_rearms` equal to the number of turns, and no
+user speech transcribed during any reply.
 
-This branch makes the microphone stay live through playback.
+Keeping the microphone open through playback is the easy half. The other half
+is that the microphone then hears the robot, and the agent takes the robot's
+own voice for the guest's. This branch does both: a realtime listening mode,
+and echo cancellation on the device to make it usable.
+
+**State: built, covered by host and gateway tests, not yet run on a robot.**
+See "What has not been verified".
+
+## How the echo is cancelled
+
+Echo cancellation subtracts what the speaker played from what the microphone
+heard, so it needs the speaker signal as a second input. Boards designed for
+it loop the amplifier output back into a spare ADC channel. The StackChan
+build reads two capture channels and labels the second one as that reference,
+but when echo cancellation was first switched on over it the microphone went
+silent (see "First flash").
+
+So the reference is made in software, from the PCM the firmware hands to the
+I2S driver. The difficulty is timing: the driver queues up to 60 ms of audio,
+so the moment a sample is written says little about the moment it is played.
+`boards/stackchan/echo_reference.{h,cc}` therefore does not take the samples
+where they are written. It takes them from the driver's "this DMA buffer has
+just been sent" interrupt, and it counts buffers in the capture interrupt as
+well. Playback and capture share one I2S port and one bit clock, so the two
+counts advance frame for frame, and with a timestamp on each interrupt the
+speaker frame that was playing while a given microphone frame was captured
+follows by arithmetic.
+
+Two consequences:
+
+- The microphone signal is held back by 12 ms. A buffer is only reported once
+  it has been sent, and the reference has to be known before the echo it
+  explains arrives.
+- The reference is deliberately taken 1 ms early. A canceller copes with a
+  reference that leads the echo and not with one that trails it.
+
+The alignment re-establishes itself after anything that breaks the count:
+capture restarting, the reader falling behind and the driver dropping audio,
+the speaker clock stopping, a lost interrupt. `firmware/host_test/
+test_echo_reference.cc` runs each of those against simulated interrupts.
 
 ## What changed
 
 **Firmware**
 
-- `listen.start` from the gateway now honours `"mode": "realtime"`. In a
-  realtime session the device keeps voice processing running while it speaks
-  and returns to Listening, not Idle, when a reply ends. The session ends on
+- `listen.start` from the gateway honours `"mode": "realtime"`. In a realtime
+  session the device keeps voice processing running while it speaks and
+  returns to Listening, not Idle, when a reply ends. The session ends on
   `listen.stop`, or whenever the device reaches Idle for any other reason.
 - Realtime is refused, with a log line and a fallback to manual, unless echo
-  cancellation is on. A live microphone beside a playing speaker with nothing
-  removing the speaker from the signal feeds every reply back to the agent as
-  if the guest had said it.
-- New `{"type":"tts","state":"abort"}`: drop the audio already buffered on the
-  device. `tts.stop` ends an utterance but lets buffered frames play out, which
-  is up to a couple of seconds of a sentence that was supposed to stop.
-- Device-side AEC is **not** enabled for the StackChan build. The first
-  version of this branch did enable it, and it broke the microphone; see
-  "First flash" below. Until the board has a real echo reference, realtime
-  requests are refused by the firmware and the robot stays half-duplex.
+  cancellation is on.
+- Echo cancellation is compiled in but **off at boot**
+  (`CONFIG_USE_SWITCHABLE_DEVICE_AEC`). Until something switches it on, the
+  audio path is the one the stock firmware has: the software reference is not
+  applied and the canceller is not in the path.
+- `self.audio.set_echo_cancellation {enabled}` switches the software
+  reference and the canceller together. Not persisted: a reboot is always a
+  way back to the stock audio path.
+- `self.audio.get_echo_stats` and `self.audio.echo_probe` measure the result
+  (below).
+- `{"type":"tts","state":"abort"}` drops the audio already buffered on the
+  device. `tts.stop` ends an utterance but lets buffered frames play out,
+  which is up to a couple of seconds of a sentence that was supposed to stop.
 
 **Gateway**
 
 - `STACKCHAN_AGENTS_LISTEN_MODE=realtime` (or `listen_mode: "realtime"` on
-  `agents_converse_start`) asks the device for a realtime session. The default
-  is still `manual`, so deploying the gateway changes nothing by itself.
+  `agents_converse_start`) asks for a realtime conversation. The default is
+  still `manual`, so deploying the gateway changes nothing by itself.
+- A realtime conversation first asks the device to switch echo cancellation
+  on. If the device cannot (older firmware, or the I2S hooks failed), the
+  conversation runs in manual mode and `agents_converse_status` says so in
+  `listen_mode_note`. Echo cancellation is switched off again when the
+  conversation ends.
 - On `interruption` in realtime mode the gateway sends `tts abort` before it
   cancels playback.
 - The per-turn re-arm is still sent in realtime mode. New firmware ignores it
-  while listening; old firmware needs it. A gateway set to realtime therefore
-  cannot leave an un-flashed device deaf.
-- `agents_converse_status` reports `listen_mode`.
+  while listening; old firmware needs it.
+- New tools `set_echo_cancellation`, `get_echo_stats`, `echo_probe` relay to
+  the firmware tools of the same names.
 
 ## First flash (2026-10-10): AEC silenced the microphone
 
-Commit 702d754 built the StackChan firmware with `CONFIG_USE_DEVICE_AEC=y`.
-On the robot the microphone still produced frames (`listen()` returned 65
-frames for 3.9 s) but nothing in them could be transcribed: three
+Commit 702d754 built the StackChan firmware with `CONFIG_USE_DEVICE_AEC=y`,
+which runs the canceller from boot over the hardware's second capture
+channel. On the robot the microphone still produced frames (`listen()`
+returned 65 frames for 3.9 s) but nothing in them could be transcribed: three
 conversations, in manual and in realtime mode, were recorded by the agent as
 silence while the guest was speaking.
 
-The likely cause is in `boards/stackchan/cores3_audio_codec.cc`. The ES7210 is
-set up with MIC1, MIC2 and MIC3 on a four-slot TDM bus, and capture opens
-channels 0 and 1. `AUDIO_INPUT_REFERENCE true` then labels channel 1 as the
-echo reference, but channel 1 is the second microphone, not the speaker
-loopback. Without AEC the audio front end ignores the reference, which is why
-the stock build works. With AEC it subtracts one microphone from the other, and
-a voice that reaches both is exactly what gets removed. This reading comes from
-the code and the symptoms; the captured audio level was not measured.
-
-So AEC is off again in this branch, and the realtime plumbing stays in as dead
-weight until someone establishes which ES7210 input, if any, carries the
-speaker signal on the CoreS3 (MIC3 is the candidate) and feeds that to the AFE
-as the reference.
+What that second channel carries was never measured. The ES7210 is set up
+with MIC1, MIC2 and MIC3 and capture opens two slots, so it is either the
+second microphone or MIC3, and nothing in the code says MIC3 is wired to the
+amplifier on this board. Either would explain the result: a canceller given a
+second microphone removes the voice both microphones hear, and one given a
+floating input can decide the far end never stops talking and suppress
+everything. `echo_probe` reports the level of that channel and how it relates
+to the microphone and to the speaker signal, which settles the question the
+next time the robot is on a bench.
 
 ## What has not been verified
 
-The gateway side is covered by unit tests. **Nothing here has been heard on a
-robot.** Three things can only be settled on the hardware:
+Host tests cover the alignment arithmetic and the gateway tests cover the
+conversation logic. **Nothing here has run on a robot.** Open, in the order
+they should be checked:
 
-1. **Whether the echo cancellation is good enough.** The speaker and the
-   microphones share a small enclosure, and Espressif's own note on this option
-   asks for "physical acoustic isolation between the microphone and speaker".
-   If it is not good enough the robot will hear itself and cut its own replies
-   short, or the agent will transcribe the robot's speech as the guest's.
-2. **How it behaves with the neck servos and at the current speaker volume.**
-3. **Whether enabling AEC changes anything for `listen()` and beat mode.** With
-   AEC compiled in, the audio front end is created without its voice-activity
-   detector (`vad_init = false`), as on every other AEC board upstream.
-
-So treat the first flash as an experiment, and keep the previous firmware
-binary at hand.
+1. **That the stock path is untouched.** With echo cancellation off, the
+   microphone must behave as before. The I2S callbacks are registered either
+   way, and the front end now contains a canceller it is told not to use.
+2. **That the reference lines up on real hardware.** `get_echo_stats` must
+   show `reference.synced` and `reference.located` true with `resyncs`,
+   `relocations`, `late_frames` and `stale_frames` not growing, and
+   `echo_probe` must show the microphone following the reference by a few
+   milliseconds.
+3. **How much echo is removed.** The speaker and the microphones share a
+   small enclosure and the speaker distorts at volume, which a linear
+   canceller cannot follow. `echo_reduction_db` with nobody talking is the
+   number.
+4. **Whether what is left still trips the agent.** If `interruptions` rises
+   while nobody speaks, or replies stop by themselves, the residue is too
+   loud: lower the speaker volume first.
+5. **Whether the guest is still heard while the robot talks.** That is the
+   point of the exercise and the one thing only a person can check.
 
 ## Build and flash
 
@@ -97,6 +147,39 @@ esptool.py --chip esp32s3 --port /dev/cu.usbmodem1101 -b 460800 \
   write_flash 0x20000 build/xiaozhi.bin
 ```
 
+Keep the previous `xiaozhi.bin`, or a full `read_flash 0x0 0x1000000` backup,
+at hand. Avatar sets live in PSRAM and have to be loaded again after any
+reboot.
+
+## Measure before trusting it
+
+All of this can be done without anybody speaking to the robot.
+
+```text
+set_echo_cancellation {enabled: true}
+get_echo_stats {reset: true}
+echo_probe {action: "arm"}
+agents_converse_start {listen_mode: "realtime"}     # let the greeting play
+echo_probe {action: "result"}
+get_echo_stats {}
+agents_converse_status {}
+```
+
+| reading | good | means trouble |
+|---|---|---|
+| `reference.synced`, `reference.located` | both true | reference is silence; nothing is cancelled |
+| `reference.resyncs`, `relocations` | 0, or 1 after a hiccup | climbing: the two clocks keep losing each other |
+| `reference.late_frames`, `stale_frames` | 0 | the 12 ms hold-back is too short, or the reader stalls |
+| `echo_probe.mic_vs_reference.lag_ms` | +1 to +10 | negative: reference trails the echo and is useless |
+| `echo_probe.mic_vs_reference.correlation` | well away from 0 | near 0: microphone does not hear the speaker, or misaligned |
+| `echo_reduction_db` (room quiet) | well above `quiet_reduction_db` | equal: the canceller removes nothing |
+| `agents_converse_status.interruptions` | 0 while nobody speaks | the agent hears the robot |
+
+`echo_probe.second_channel_*` describes the hardware channel the software
+reference replaces. A correlation with the microphone near 1 at 0 ms means it
+is a second microphone; a correlation with the reference near 1 means the
+board has a loopback after all and could use it directly.
+
 ## Turn it on
 
 On the gateway host, add to the gateway's environment and restart it:
@@ -108,32 +191,19 @@ STACKCHAN_AGENTS_LISTEN_MODE=realtime
 For a single call without touching the environment, pass
 `{"listen_mode": "realtime"}` to `agents_converse_start`.
 
-## Check that it works
+Then read `agents_converse_status` during a conversation:
 
-Start a conversation, ask for something long, and talk over the answer. Then
-read `agents_converse_status`:
-
-| field | half-duplex (before) | realtime working |
+| field | half-duplex | realtime working |
 |---|---|---|
 | `listen_mode` | `manual` | `realtime` |
+| `listen_mode_note` | set if realtime was asked for and refused | `null` |
+| `echo_cancellation` | `null` or `false` | `true` |
 | `frames_uplinked` | stops growing while the robot speaks | keeps growing while the robot speaks |
 | `interruptions` | `0` | goes up when you talk over a reply |
-
-`listen_mode: realtime` with `frames_uplinked` frozen during replies means the
-firmware did not accept the mode: either it is the old build, or it logged
-`Realtime listening needs echo cancellation` on the serial console.
-
-Signs that the echo cancellation is not holding:
-
-- `interruptions` rises while nobody is speaking;
-- replies stop a second or two in, by themselves;
-- the conversation transcript shows the robot's own sentences as user turns.
-
-If that happens, lower the speaker volume first (`set_volume`), then consider
-the agent's turn settings on the ElevenLabs side before giving up on the mode.
 
 ## Go back
 
 Set `STACKCHAN_AGENTS_LISTEN_MODE=manual` (or remove it) and restart the
 gateway. That alone restores the old behaviour, whatever firmware is on the
-robot. To undo the firmware as well, flash the previous `xiaozhi.bin`.
+robot. On the device, a reboot switches echo cancellation off. To undo the
+firmware as well, flash the previous `xiaozhi.bin`.
