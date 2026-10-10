@@ -741,3 +741,249 @@ async def test_a_manual_conversation_never_touches_echo_cancellation() -> None:
 
     assert gateway.esp32.tool_calls == []
     assert conv.status()["echo_cancellation"] is None
+
+
+# --- one conversation ending, the next beginning ----------------------
+#
+# Each of these is a way for a conversation that is over to go on acting:
+# on the device, or on the conversation that follows it.
+
+
+async def _speaking_stream(gateway: Any, chunks: Any, **_kwargs: Any) -> None:
+    """``send_pcm_stream`` as the device sees it: tts.start, paced audio, tts.stop."""
+    await gateway.esp32.send_tts_state("start")
+    try:
+        async for _chunk in chunks:
+            await asyncio.sleep(0.02)
+    finally:
+        await gateway.esp32.send_tts_state("stop")
+
+
+@pytest.mark.asyncio
+async def test_stop_mid_reply_ends_the_playback_loop_for_good(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reply cut short by ``stop`` must not start again behind its back.
+
+    The loop used to take its own cancellation for the turn's and carry on
+    with what was left in the queue: ``stop`` waited out its grace period,
+    released the device, and the rest of the reply was then played to it
+    anyway -- holding the TTS lock against whichever conversation came next.
+    """
+    monkeypatch.setattr(agents_mode, "send_pcm_stream", _speaking_stream)
+    monkeypatch.setattr(agents_mode, "STOP_GRACE_S", 1.0)
+    monkeypatch.setattr(agents_mode, "TURN_IDLE_TIMEOUT_S", 0.05)
+
+    gateway = _FakeGateway()
+    conv = _conversation(gateway)
+    conv._ws = _FakeWS()
+    conv._active = True
+    for _ in range(50):
+        conv._playback_queue.put_nowait(b"reply")
+    loop_task = asyncio.create_task(conv._playback_loop())
+    conv._tasks = [loop_task]
+    await _wait_until(lambda: gateway.esp32.tts_calls == ["start"])
+
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    await conv.stop()
+    took = loop.time() - began
+
+    assert loop_task.done(), "the playback loop outlived stop"
+    assert took < 0.5, "stop sat out its grace period waiting for the loop"
+    # Long enough for a loop that survived to start on the rest of the reply.
+    await asyncio.sleep(0.2)
+    assert gateway.esp32.tts_calls == ["start", "stop"]
+    assert conv._playback_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_an_interruption_ends_the_turn_but_not_the_playback_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other cancellation the loop sees, which it does have to survive."""
+    monkeypatch.setattr(agents_mode, "send_pcm_stream", _speaking_stream)
+    monkeypatch.setattr(agents_mode, "TURN_IDLE_TIMEOUT_S", 0.05)
+
+    gateway = _FakeGateway()
+    conv = _conversation(gateway)
+    conv._active = True
+    for _ in range(50):
+        conv._playback_queue.put_nowait(b"reply")
+    loop_task = asyncio.create_task(conv._playback_loop())
+    try:
+        await _wait_until(lambda: gateway.esp32.tts_calls == ["start"])
+        await conv._handle_event({"type": "interruption", "interruption_event": {"event_id": 1}})
+        await _wait_until(lambda: conv.status()["listen_rearms"] == 1)
+
+        assert gateway.esp32.tts_calls == ["start", "stop"]
+        assert not loop_task.done(), "an interruption took the playback loop down"
+
+        await conv._enqueue_playback(b"next reply")
+        await _wait_until(lambda: conv.status()["turns_played"] == 1)
+    finally:
+        loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop_task
+
+    assert gateway.esp32.tts_calls == ["start", "stop", "start", "stop"]
+
+
+@pytest.mark.asyncio
+async def test_the_farewell_does_not_reopen_the_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a hangup the turn that ends is the last: nothing is listening.
+
+    Re-arming there puts ``listen.start`` on the wire milliseconds ahead of
+    the teardown's ``listen.stop``. The firmware can apply those two in the
+    opposite order, which leaves the device listening after it was released.
+    """
+    monkeypatch.setattr(agents_mode, "send_pcm_stream", _speaking_stream)
+    monkeypatch.setattr(agents_mode, "TURN_IDLE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(agents_mode, "FAREWELL_GRACE_S", 5.0)
+
+    gateway = _FakeGateway()
+    conv = _conversation(gateway, listen_mode="realtime")
+    conv._ws = _FakeWS()
+    conv._active = True
+    monkeypatch.setattr(agents_mode, "_mode", conv)
+    conv._playback_queue.put_nowait(b"goodbye")
+    loop_task = asyncio.create_task(conv._playback_loop())
+    conv._tasks = [loop_task]
+    await _wait_until(lambda: gateway.esp32.tts_calls == ["start"])
+
+    conv._note_far_side_hangup(_ConnectionClosedOK("1000 (OK)"))
+    assert conv._teardown_task is not None
+    await asyncio.wait_for(conv._teardown_task, timeout=5.0)
+
+    # The goodbye was played to its end, and then only the release followed.
+    assert gateway.esp32.tts_calls == ["start", "stop"]
+    assert conv.status()["turns_played"] == 1
+    assert gateway.esp32.listen_calls == [("stop", "manual", "voice")]
+    assert conv.status()["listen_rearms"] == 0
+    assert agents_mode._mode is None
+
+
+@pytest.mark.asyncio
+async def test_a_late_hangup_teardown_leaves_the_next_conversation_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The farewell grace can outlast the conversation it belongs to.
+
+    Stopped by hand while its goodbye was still playing, a conversation used
+    to come back when the grace ran out and stop whatever was current.
+    """
+    monkeypatch.setattr(agents_mode, "FAREWELL_GRACE_S", 0.05)
+
+    finished = _conversation()
+    gateway = _FakeGateway()
+    current = _conversation(gateway)
+    current._ws = _FakeWS()
+    current._active = True
+    monkeypatch.setattr(agents_mode, "_mode", current)
+
+    await finished._teardown_after_hangup()
+
+    assert current.active
+    assert agents_mode._mode is current
+    assert gateway.esp32.listen_calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_stop_retires_the_pending_hangup_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(agents_mode, "FAREWELL_GRACE_S", 30.0)
+
+    conv = _conversation()
+    conv._ws = _FakeWS()
+    conv._active = True
+    monkeypatch.setattr(agents_mode, "_mode", conv)
+    # A goodbye nobody is playing keeps the teardown waiting out its grace.
+    conv._playback_queue.put_nowait(b"farewell")
+
+    conv._note_far_side_hangup(_ConnectionClosedOK("1000 (OK)"))
+    teardown = conv._teardown_task
+    assert teardown is not None
+    await asyncio.sleep(0.1)
+    assert not teardown.done()
+
+    status = await agents_mode.stop_agents_conversation()
+
+    # Stopped by hand, but it was the far side that ended it.
+    assert status["ended_reason"] == "agent_hangup"
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(teardown, timeout=1.0)
+    assert teardown.cancelled()
+    assert agents_mode._mode is None
+
+
+@pytest.mark.asyncio
+async def test_start_ends_a_leftover_listening_session_before_opening_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The device ignores ``listen.start`` while it is already listening.
+
+    Seen 2026-10-10: a device still listening from the conversation before
+    took the new one's ``listen.start`` as a no-op, and the board's 30 s
+    listening timeout, counted from the old session, cut the microphone
+    4.5 s in. 76 frames went up and then none; the agent, hearing nothing,
+    never spoke, so no turn ended and nothing re-armed the microphone.
+    """
+    monkeypatch.setattr(agents_mode, "LISTEN_RESET_SETTLE_S", 0.05)
+    monkeypatch.setattr(agents_mode, "_mode", None)
+
+    class _QuietWS(_FakeWS):
+        async def recv(self) -> str:
+            if self._inbound:
+                return json.dumps(self._inbound.pop(0))
+            await asyncio.sleep(3600)
+            raise AssertionError("unreachable")
+
+    ws = _QuietWS(
+        [
+            {
+                "type": "conversation_initiation_metadata",
+                "conversation_initiation_metadata_event": {
+                    "conversation_id": "conv_next",
+                    "user_input_audio_format": "pcm_16000",
+                    "agent_output_audio_format": "pcm_16000",
+                },
+            }
+        ]
+    )
+
+    async def _signed_url(*_args: Any, **_kwargs: Any) -> str:
+        return "wss://example.invalid/conversation"
+
+    async def _connect(*_args: Any, **_kwargs: Any) -> _FakeWS:
+        return ws
+
+    monkeypatch.setattr(agents_mode, "fetch_signed_url", _signed_url)
+    monkeypatch.setattr("websockets.connect", _connect)
+    monkeypatch.setattr(agents_mode, "StreamingOpusDecoder", lambda: None)
+    monkeypatch.setattr(agents_mode, "start_recording", lambda *_a, **_k: None)
+
+    gateway = _FakeGateway()
+    sent_at: list[float] = []
+    record = gateway.esp32.send_listen_state
+
+    async def _timed(state: str, mode: str = "manual", profile: str = "voice") -> None:
+        sent_at.append(asyncio.get_running_loop().time())
+        await record(state, mode=mode, profile=profile)
+
+    gateway.esp32.send_listen_state = _timed  # type: ignore[method-assign]
+
+    conv = _conversation(gateway)
+    try:
+        status = await conv.start()
+        assert status["active"] is True
+        assert gateway.esp32.listen_calls == [
+            ("stop", "manual", "voice"),
+            ("start", "manual", "voice"),
+        ]
+        # Far enough apart for the board to have seen the device idle.
+        assert sent_at[1] - sent_at[0] >= 0.04
+    finally:
+        await conv.stop()

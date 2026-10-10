@@ -115,6 +115,11 @@ STOP_GRACE_S = 5.0
 #: ever delays releasing a device nobody else is waiting on.
 FAREWELL_GRACE_S = 10.0
 
+#: Pause between ending a listening session the device may still be in and
+#: opening ours; see :meth:`AgentsConversation._end_stale_listening`. The
+#: board samples the device state every 20 ms, and has to see it idle.
+LISTEN_RESET_SETTLE_S = 0.1
+
 _mode: "AgentsConversation | None" = None
 _mode_lock: asyncio.Lock | None = None
 
@@ -361,6 +366,7 @@ class AgentsConversation:
             # message opens the microphone for the whole conversation: the
             # device keeps capturing through its own speech and returns to
             # listening by itself when a reply ends.
+            await self._end_stale_listening()
             if self._listen_mode == LISTEN_MODE_REALTIME:
                 await self._prepare_realtime()
             await self._gateway.esp32.send_listen_state(
@@ -412,6 +418,27 @@ class AgentsConversation:
                 f"{REQUIRED_AUDIO_FORMAT!r} in both directions. Change the "
                 "agent's audio format in its ElevenLabs configuration."
             )
+
+    async def _end_stale_listening(self) -> None:
+        """Take the device out of any listening session it is still in.
+
+        The firmware ignores ``listen.start`` while it is listening: the
+        mode is not changed and capture is not restarted. A device left
+        listening -- by a conversation whose release it missed, by a touch,
+        by a gateway restarted mid-call -- therefore carries that session
+        into this one. With it comes the board's clock: it stops listening
+        by itself 30 s after it *entered* the state, which for a session
+        that is already 25 s old is five seconds into the new conversation.
+        After that nothing goes up, the agent waits for a guest it cannot
+        hear, and the microphone is never re-armed because no turn ever
+        ends -- ``frames_uplinked`` stops and ``turns_played`` stays at 0.
+
+        ``listen.stop`` does nothing on an idle device. The pause is for the
+        board, which recognises a new session by sampling the state: leave
+        and re-enter between two samples and it keeps the old clock.
+        """
+        await self._gateway.esp32.send_listen_state("stop")
+        await asyncio.sleep(LISTEN_RESET_SETTLE_S)
 
     async def _prepare_realtime(self) -> None:
         """Have the device cancel its own echo, or give up on realtime.
@@ -482,6 +509,13 @@ class AgentsConversation:
             if self._ended_reason is None:
                 self._ended_reason = "local_stop"
 
+            # A hangup teardown still waiting out the farewell has nothing
+            # left to do once somebody else stops the conversation. Unless
+            # it is the caller: then it is the thing running this.
+            teardown = self._teardown_task
+            if teardown is not None and teardown is not asyncio.current_task():
+                teardown.cancel()
+
             for task in self._tasks:
                 task.cancel()
             if self._tasks:
@@ -492,6 +526,10 @@ class AgentsConversation:
                 await asyncio.wait(self._tasks, timeout=STOP_GRACE_S)
             self._tasks = []
             await self._cancel_playback()
+            # The rest of a reply that was cut short. Nothing reads the
+            # queue any more, and nothing may: it belongs to a conversation
+            # the device has been told is over.
+            self._drain_playback_queue()
 
             self._release_recording_slot()
             with contextlib.suppress(Exception):
@@ -707,14 +745,17 @@ class AgentsConversation:
     async def _teardown_after_hangup(self) -> None:
         """Let the farewell finish, then release the device.
 
-        Routed through the module-level ``stop_agents_conversation`` rather
-        than ``self.stop`` so the global ``_mode`` slot is cleared too: a
-        stale entry would keep reporting a conversation that is long gone.
+        Routed through the module-level ``_reap_conversation`` rather than
+        ``self.stop`` so the global ``_mode`` slot is cleared too: a stale
+        entry would keep reporting a conversation that is long gone. And
+        through that rather than ``stop_agents_conversation``, which stops
+        whatever conversation is current -- by the time the farewell has
+        played out, that can be the next one.
         """
         with contextlib.suppress(Exception):
             await self._drain_playback(FAREWELL_GRACE_S)
         with contextlib.suppress(Exception):
-            await stop_agents_conversation()
+            await _reap_conversation(self)
 
     async def _drain_playback(self, timeout_s: float) -> None:
         """Wait until nothing is queued for, or playing on, the speaker."""
@@ -750,8 +791,17 @@ class AgentsConversation:
         the message; firmware that does not has fallen back to manual and
         needs it exactly as before. Sending it either way means a gateway
         configured for realtime never leaves an older device deaf.
+
+        It does not run for the farewell. Once the far side has hung up
+        nothing reads the microphone, and the teardown waiting on that turn
+        sends ``listen.stop`` within milliseconds. The firmware acts on a
+        ``listen.stop`` as it arrives but queues a ``listen.start`` for its
+        main task, so a stop that close behind a start can be applied
+        first: the start then wins, and the device sits in a listening
+        session nobody owns. It ignores ``listen.start`` while listening,
+        so the next conversation silently inherits that session's mode.
         """
-        if not self._active:
+        if not self._active or self._ended_reason is not None:
             # ``stop`` clears the flag before it cancels these tasks, so
             # this keeps teardown from re-opening the mic on its way out.
             return
@@ -777,16 +827,30 @@ class AgentsConversation:
         one place every turn passes through on its way back to idle,
         whether it ended on a marker, on the idle timeout, or on an
         interruption cancelling playback mid-sentence.
+
+        The turn is waited for with ``asyncio.wait`` rather than awaited.
+        Awaiting it raises ``CancelledError`` here both when an interruption
+        cancels the turn and when ``stop`` cancels this loop, and the two
+        need opposite answers: carry on, and end. Treating both as "carry
+        on" left a loop that outlived ``stop`` and went on to play whatever
+        was still queued -- tts.start, audio and tts.stop sent to a device
+        that had been released, with the TTS lock held against the next
+        conversation's first reply. ``asyncio.wait`` raises only for the
+        loop's own cancellation.
         """
         while True:
             first = await self._playback_queue.get()
             if first is None:
                 continue
-            self._playback_task = asyncio.create_task(
-                self._play_turn(first), name="agents-play-turn"
-            )
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._playback_task
+            turn = asyncio.create_task(self._play_turn(first), name="agents-play-turn")
+            self._playback_task = turn
+            try:
+                await asyncio.wait({turn})
+            except asyncio.CancelledError:
+                # Take the turn down too, and give it the time to send its
+                # tts.stop, so the device is not left in the speaking state.
+                await self._cancel_playback()
+                raise
             self._playback_task = None
             await self._rearm_listening()
 
@@ -871,6 +935,20 @@ async def stop_agents_conversation() -> dict[str, Any]:
         status = await _mode.stop()
         _mode = None
         return status
+
+
+async def _reap_conversation(conversation: AgentsConversation) -> None:
+    """Stop ``conversation`` and free the module slot if it still holds it.
+
+    For a conversation ending itself. Under the same lock as the public
+    start and stop, so it cannot interleave with either, but it never
+    touches a conversation other than the one it was given.
+    """
+    global _mode
+    async with _get_mode_lock():
+        await conversation.stop()
+        if _mode is conversation:
+            _mode = None
 
 
 def get_agents_conversation_snapshot() -> dict[str, Any]:
