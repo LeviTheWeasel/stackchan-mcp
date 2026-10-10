@@ -2152,12 +2152,13 @@ async def test_echo_tools_relay_to_the_firmware(monkeypatch):
 
     listed = await server.request_handlers[ListToolsRequest](ListToolsRequest(method="tools/list"))
     names = {tool.name for tool in listed.root.tools}
-    assert {"set_echo_cancellation", "get_echo_stats", "echo_probe"} <= names
+    assert {"set_echo_cancellation", "get_echo_stats", "echo_probe", "set_echo_options"} <= names
 
     for name, arguments in (
         ("set_echo_cancellation", {"enabled": True}),
         ("get_echo_stats", {"reset": True}),
         ("echo_probe", {"action": "arm"}),
+        ("set_echo_options", {"aec_mode": "voip_low_cost", "input_core": 1}),
     ):
         await server.request_handlers[CallToolRequest](
             CallToolRequest(method="tools/call", params={"name": name, "arguments": arguments})
@@ -2167,4 +2168,5 @@ async def test_echo_tools_relay_to_the_firmware(monkeypatch):
         ("self.audio.set_echo_cancellation", {"enabled": True}),
         ("self.audio.get_echo_stats", {"reset": True}),
         ("self.audio.echo_probe", {"action": "arm"}),
+        ("self.audio.set_echo_options", {"aec_mode": "voip_low_cost", "input_core": 1}),
     ]

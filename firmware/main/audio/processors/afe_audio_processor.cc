@@ -1,4 +1,5 @@
 #include "afe_audio_processor.h"
+#include "settings.h"
 #include <esp_log.h>
 
 #define PROCESSOR_RUNNING 0x01
@@ -63,6 +64,33 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     // Both stages are built; EnableDeviceAec() chooses which one runs.
     afe_config->aec_init = true;
     afe_config->vad_init = true;
+    {
+        // What the canceller costs and what it leaves behind have to be
+        // found by measuring on the device, so the choices that are fixed
+        // when the front end is created come from settings (written by
+        // self.audio.set_echo_options, applied on the next boot). With
+        // nothing stored this is the configuration above.
+        Settings settings("echo", false);
+        int aec_mode = settings.GetInt("aec_mode", AEC_MODE_VOIP_HIGH_PERF);
+        if (aec_mode == AEC_MODE_SR_LOW_COST || aec_mode == AEC_MODE_SR_HIGH_PERF ||
+            aec_mode == AEC_MODE_VOIP_LOW_COST || aec_mode == AEC_MODE_VOIP_HIGH_PERF) {
+            afe_config->aec_mode = (aec_mode_t)aec_mode;
+        }
+        int filter_length = settings.GetInt("filter_len", 0);
+        if (filter_length >= 1 && filter_length <= 8) {
+            afe_config->aec_filter_length = filter_length;
+        }
+        if (!settings.GetBool("ns", true)) {
+            afe_config->ns_init = false;
+        }
+        int afe_core = settings.GetInt("afe_core", -1);
+        if (afe_core == 0 || afe_core == 1) {
+            afe_config->afe_perferred_core = afe_core;
+        }
+        ESP_LOGI(TAG, "Voice front end: aec_mode=%d filter_length=%d ns=%d core=%d",
+            (int)afe_config->aec_mode, afe_config->aec_filter_length,
+            (int)afe_config->ns_init, afe_config->afe_perferred_core);
+    }
 #else
     afe_config->aec_init = false;
     afe_config->vad_init = true;

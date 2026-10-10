@@ -131,6 +131,19 @@ struct EchoLevels {
     uint32_t output_samples_quiet = 0;
 };
 
+// How the capture loop spends its time. One loop reads 10 ms of audio and
+// hands it to the front end; when the handing-over takes longer than the
+// audio lasts, the loop falls behind and the I2S driver starts discarding
+// what was captured.
+struct InputLoad {
+    uint32_t loops = 0;
+    uint64_t wait_us = 0;       // time spent waiting for audio; near zero when behind
+    uint64_t work_us = 0;       // time spent feeding the front end
+    uint32_t max_work_us = 0;
+    uint32_t slow_loops = 0;    // work took longer than the 10 ms it was given
+    uint32_t stalled_loops = 0; // work took longer than the driver can buffer (50 ms)
+};
+
 class AudioService {
 public:
     AudioService();
@@ -156,6 +169,7 @@ public:
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
     EchoLevels GetEchoLevels(bool reset);
+    InputLoad GetInputLoad(bool reset);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
@@ -173,6 +187,8 @@ private:
     std::mutex echo_levels_mutex_;
     EchoLevels echo_levels_;
     std::atomic<int64_t> reference_heard_us_{0};  // last time the reference carried signal
+    InputLoad input_load_;
+    void NoteInputLoad(int64_t wait_us, int64_t work_us);
     void NoteVoiceInput(const std::vector<int16_t>& interleaved);
     void NoteVoiceOutput(const std::vector<int16_t>& mono);
     std::unique_ptr<AudioProcessor> audio_processor_;

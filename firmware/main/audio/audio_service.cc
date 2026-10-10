@@ -1,4 +1,5 @@
 #include "audio_service.h"
+#include "settings.h"
 #include <esp_log.h>
 #include <algorithm>
 #include <cstring>
@@ -141,11 +142,25 @@ void AudioService::Start() {
 
 #if CONFIG_USE_AUDIO_PROCESSOR
     /* Start the audio input task */
+    // Core 0 unless the "echo" settings say otherwise. That core also runs
+    // Wi-Fi, and with echo cancellation on this task does the cancelling,
+    // so where it runs is one of the things worth measuring; see
+    // self.audio.set_echo_options.
+    BaseType_t input_core = 0;
+    {
+        Settings settings("echo", false);
+        int chosen = settings.GetInt("in_core", 0);
+        if (chosen == 1) {
+            input_core = 1;
+        } else if (chosen < 0) {
+            input_core = tskNO_AFFINITY;
+        }
+    }
     xTaskCreatePinnedToCore([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioInputTask();
         vTaskDelete(NULL);
-    }, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);
+    }, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, input_core);
 
     /* Start the audio output task */
     xTaskCreate([](void* arg) {
@@ -287,7 +302,9 @@ void AudioService::AudioInputTask() {
                     AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
             int samples = 160; // 10ms
             std::vector<int16_t> data;
+            const int64_t asked_us = esp_timer_get_time();
             if (ReadAudioData(data, 16000, samples)) {
+                const int64_t got_us = esp_timer_get_time();
                 if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
                     wake_word_->Feed(data);
                 }
@@ -297,6 +314,7 @@ void AudioService::AudioInputTask() {
                     NoteVoiceInput(data);
                     audio_processor_->Feed(std::move(data));
                 }
+                NoteInputLoad(got_us - asked_us, esp_timer_get_time() - got_us);
                 continue;
             }
         }
@@ -942,6 +960,31 @@ void AudioService::NoteVoiceOutput(const std::vector<int16_t>& mono) {
         echo_levels_.output_energy_quiet += energy;
         echo_levels_.output_samples_quiet += mono.size();
     }
+}
+
+void AudioService::NoteInputLoad(int64_t wait_us, int64_t work_us) {
+    std::lock_guard<std::mutex> lock(echo_levels_mutex_);
+    ++input_load_.loops;
+    input_load_.wait_us += wait_us;
+    input_load_.work_us += work_us;
+    if (work_us > input_load_.max_work_us) {
+        input_load_.max_work_us = (uint32_t)work_us;
+    }
+    if (work_us > 10 * 1000) {
+        ++input_load_.slow_loops;
+    }
+    if (work_us > 50 * 1000) {
+        ++input_load_.stalled_loops;
+    }
+}
+
+InputLoad AudioService::GetInputLoad(bool reset) {
+    std::lock_guard<std::mutex> lock(echo_levels_mutex_);
+    InputLoad load = input_load_;
+    if (reset) {
+        input_load_ = InputLoad();
+    }
+    return load;
 }
 
 EchoLevels AudioService::GetEchoLevels(bool reset) {

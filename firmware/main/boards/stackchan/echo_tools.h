@@ -14,6 +14,9 @@ class McpServer;
  *   self.audio.echo_probe              record a moment of playback and report
  *                                      how the microphone relates to the
  *                                      reference
+ *   self.audio.set_echo_options        store how the front end is built
+ *                                      (canceller mode, cores), for the next
+ *                                      boot
  *
  * The measuring ones exist because the first attempt at echo cancellation on
  * this board was judged by holding a conversation with it, which says "the

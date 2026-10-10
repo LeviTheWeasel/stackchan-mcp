@@ -1150,6 +1150,10 @@ async def _dispatch_mcp_tool(
             "self.audio.echo_probe",
             arguments,
         ),
+        "set_echo_options": (
+            "self.audio.set_echo_options",
+            arguments,
+        ),
         "set_led": (
             "self.led.set_color",
             arguments,
@@ -2093,6 +2097,51 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                             "enum": ["arm", "result"],
                             "default": "result",
                         },
+                    },
+                },
+            ),
+            Tool(
+                name="set_echo_options",
+                description=(
+                    "Store how the device builds its voice front end, for "
+                    "finding an echo cancellation setup the robot can afford: "
+                    "the canceller's mode, its filter length, noise "
+                    "suppression, and which core the capture task and the "
+                    "front end run on. Only the fields given change; "
+                    "reset=true restores the defaults. Stored on the device "
+                    "and applied at its next boot; reboot=true restarts it "
+                    "once the reply is sent, after which avatar sets have to "
+                    "be loaded again. get_echo_stats shows what is stored."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "aec_mode": {
+                            "type": "string",
+                            "enum": ["sr_low_cost", "sr_high_perf", "voip_low_cost", "voip_high_perf"],
+                            "description": "voip_* also suppress what the linear canceller leaves; sr_* do not.",
+                        },
+                        "filter_length": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 8,
+                            "description": "Echo tail covered, in 16 ms blocks; 0 for the library default.",
+                        },
+                        "noise_suppression": {"type": "string", "enum": ["on", "off"]},
+                        "input_core": {
+                            "type": "integer",
+                            "minimum": -1,
+                            "maximum": 1,
+                            "description": "Core of the capture task; -1 lets the scheduler choose.",
+                        },
+                        "afe_core": {
+                            "type": "integer",
+                            "minimum": -1,
+                            "maximum": 1,
+                            "description": "Core the front end prefers; -1 for the library default.",
+                        },
+                        "reset": {"type": "boolean", "default": False},
+                        "reboot": {"type": "boolean", "default": False},
                     },
                 },
             ),
