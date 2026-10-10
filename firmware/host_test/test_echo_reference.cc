@@ -374,6 +374,69 @@ TEST(EchoReferenceTest, RecordsWhatTheCancellerIsGivenOnceTheSpeakerIsHeard) {
     EXPECT_NEAR(RampDistance(reference[2000], mic[2000]) - kEchoDelay, kLead, 2);
 }
 
+// The send interrupt as the driver delivers it: OnSent() for every buffer,
+// followed by OnSendOverflow() when the player had written nothing new.
+void Send(EchoReference& reference, int64_t& now_us, int buffers, bool starved) {
+    static const std::vector<int16_t> samples(kBuffer, 0);
+    for (int i = 0; i < buffers; ++i) {
+        now_us += kPeriodUs;
+        reference.OnSent(samples.data(), 1, now_us);
+        if (starved) {
+            reference.OnSendOverflow();
+        }
+    }
+}
+
+TEST(EchoReferenceTest, CountsTheHolesInPlaybackByLength) {
+    EchoReference reference{EchoReference::Config{}};
+    int64_t now_us = 0;
+    Send(reference, now_us, 50, false);
+    Send(reference, now_us, 2, true);    // 20 ms
+    Send(reference, now_us, 30, false);
+    Send(reference, now_us, 7, true);    // 70 ms
+    Send(reference, now_us, 30, false);
+    Send(reference, now_us, 25, true);   // 250 ms
+    Send(reference, now_us, 30, false);
+    auto stats = reference.GetStats();
+    EXPECT_EQ(stats.dropouts_30ms, 1u);
+    EXPECT_EQ(stats.dropouts_100ms, 1u);
+    EXPECT_EQ(stats.dropouts_500ms, 1u);
+    EXPECT_EQ(stats.dropout_buffers, 34u);
+    EXPECT_EQ(stats.idle_runs, 0u);
+}
+
+TEST(EchoReferenceTest, PutsAHoleOnTheRightSideOfEachLimit) {
+    const struct { int buffers; int upto_30; int upto_100; int upto_500; int idle; } cases[] = {
+        {1, 1, 0, 0, 0}, {3, 1, 0, 0, 0}, {4, 0, 1, 0, 0}, {10, 0, 1, 0, 0},
+        {11, 0, 0, 1, 0}, {50, 0, 0, 1, 0}, {51, 0, 0, 0, 1},
+    };
+    for (const auto& c : cases) {
+        EchoReference reference{EchoReference::Config{}};
+        int64_t now_us = 0;
+        Send(reference, now_us, 10, false);
+        Send(reference, now_us, c.buffers, true);
+        Send(reference, now_us, 10, false);
+        auto stats = reference.GetStats();
+        EXPECT_EQ(stats.dropouts_30ms, (uint32_t)c.upto_30) << c.buffers << " buffers";
+        EXPECT_EQ(stats.dropouts_100ms, (uint32_t)c.upto_100) << c.buffers << " buffers";
+        EXPECT_EQ(stats.dropouts_500ms, (uint32_t)c.upto_500) << c.buffers << " buffers";
+        EXPECT_EQ(stats.idle_runs, (uint32_t)c.idle) << c.buffers << " buffers";
+        EXPECT_EQ(stats.dropout_buffers, c.idle ? 0u : (uint32_t)c.buffers) << c.buffers << " buffers";
+    }
+}
+
+TEST(EchoReferenceTest, DoesNotCallAnUnusedSpeakerADropout) {
+    EchoReference reference{EchoReference::Config{}};
+    int64_t now_us = 0;
+    Send(reference, now_us, 300, true);  // nothing played since boot
+    Send(reference, now_us, 100, false);
+    Send(reference, now_us, 300, true);  // and nothing after: this run is still open
+    auto stats = reference.GetStats();
+    EXPECT_EQ(stats.idle_runs, 1u);
+    EXPECT_EQ(stats.dropouts_30ms + stats.dropouts_100ms + stats.dropouts_500ms, 0u);
+    EXPECT_EQ(stats.dropout_buffers, 0u);
+}
+
 TEST(AnalyzeEchoTest, FindsTheDelayAndStrengthOfAnEcho) {
     std::mt19937 random(7);
     std::uniform_int_distribution<int> speech(-8000, 8000);

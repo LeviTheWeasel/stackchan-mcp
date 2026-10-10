@@ -200,6 +200,7 @@ void CoreS3AudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gp
     // reported and survived rather than treated like the calls around it.
     i2s_event_callbacks_t tx_callbacks = {};
     tx_callbacks.on_sent = OnI2sSent;
+    tx_callbacks.on_send_q_ovf = OnI2sSendOverflow;
     i2s_event_callbacks_t rx_callbacks = {};
     rx_callbacks.on_recv = OnI2sReceived;
     rx_callbacks.on_recv_q_ovf = OnI2sReceiveOverflow;
@@ -296,6 +297,11 @@ bool CoreS3AudioCodec::OnI2sSent(i2s_chan_handle_t handle, i2s_event_data_t* eve
     const bool known_layout = event->dma_buf != nullptr && (stride == 1 || stride == 2);
     self->echo_reference_.OnSent(known_layout ? static_cast<const int16_t*>(event->dma_buf) : nullptr,
         stride, esp_timer_get_time());
+    return false;
+}
+
+bool CoreS3AudioCodec::OnI2sSendOverflow(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx) {
+    static_cast<CoreS3AudioCodec*>(user_ctx)->echo_reference_.OnSendOverflow();
     return false;
 }
 

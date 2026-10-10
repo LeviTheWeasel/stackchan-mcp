@@ -76,6 +76,18 @@ public:
         uint64_t late_frames = 0;    // wanted speaker frame had not been sent yet
         uint64_t stale_frames = 0;   // wanted speaker frame was already overwritten
         uint64_t silent_frames = 0;  // clocks not tied yet or speaker stopped; reference is silence
+
+        // Playback, counted whether or not the reference is enabled. A
+        // buffer sent before the player had written anything new into the
+        // queue goes out as silence. A run of those that ends with sound
+        // again is counted by its length: the short ones fall inside a
+        // reply and are heard as stutter, the long ones are the speaker
+        // simply not being used.
+        uint32_t dropouts_30ms = 0;      // runs of up to 30 ms
+        uint32_t dropouts_100ms = 0;     // over 30 ms, up to 100 ms
+        uint32_t dropouts_500ms = 0;     // over 100 ms, up to 500 ms
+        uint32_t dropout_buffers = 0;    // buffers in all of those runs together
+        uint32_t idle_runs = 0;          // longer than 500 ms
     };
 
     explicit EchoReference(const Config& config);
@@ -85,6 +97,10 @@ public:
     // One DMA buffer has just been sent. `samples` holds
     // frames_per_interrupt frames, the wanted sample every `stride` int16.
     void OnSent(const int16_t* samples, size_t stride, int64_t now_us);
+    // The buffer just reported by OnSent() went out with the player behind:
+    // everything it had written has been sent. The driver reports this after
+    // OnSent() for the same buffer.
+    void OnSendOverflow();
     // One DMA buffer has just been filled by the microphones.
     void OnReceived(int64_t now_us);
     // The oldest unread capture buffer was thrown away to make room.
@@ -152,6 +168,10 @@ private:
     int64_t rx_dropped_frames_ = 0;
     int64_t valid_from_ = 0;  // speaker frames before this were not recorded
     Stats stats_;
+
+    // Send interrupt only.
+    bool tx_overflowed_ = false;   // OnSendOverflow() came for the previous buffer
+    uint32_t tx_starved_run_ = 0;  // consecutive buffers it came for
 
     // Capture thread only.
     bool was_enabled_ = false;

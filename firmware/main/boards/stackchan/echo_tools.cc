@@ -331,6 +331,23 @@ void RegisterEchoTools(McpServer& mcp_server, CoreS3AudioCodec* codec) {
             cJSON_AddNumberToObject(input, "slow_loops", load.slow_loops);
             cJSON_AddNumberToObject(input, "stalled_loops", load.stalled_loops);
 
+            // Whether the speaker was kept fed. The dropouts are stretches
+            // of silence that ended with sound again; the short ones fall
+            // inside a reply. Counted since boot, in manual mode as well.
+            const auto feed = Application::GetInstance().GetAudioService().GetOutputFeed(reset);
+            cJSON* playback = cJSON_AddObjectToObject(root, "playback");
+            cJSON_AddNumberToObject(playback, "dropouts_upto_30ms", stats.dropouts_30ms);
+            cJSON_AddNumberToObject(playback, "dropouts_upto_100ms", stats.dropouts_100ms);
+            cJSON_AddNumberToObject(playback, "dropouts_upto_500ms", stats.dropouts_500ms);
+            cJSON_AddNumberToObject(playback, "dropout_ms",
+                (double)stats.dropout_buffers * codec->echo_reference().config().frames_per_interrupt * 1000 /
+                    codec->echo_reference().config().sample_rate);
+            cJSON_AddNumberToObject(playback, "idle_runs", stats.idle_runs);
+            cJSON_AddNumberToObject(playback, "packets", feed.packets);
+            cJSON_AddNumberToObject(playback, "late_packets", feed.late_packets);
+            cJSON_AddNumberToObject(playback, "max_packet_gap_ms", feed.max_gap_ms);
+            cJSON_AddNumberToObject(playback, "max_packets_waiting", feed.max_waiting);
+
             AddCpuTable(root);
             AddStoredOptions(root);
             cJSON_AddBoolToObject(root, "reset", reset);

@@ -144,6 +144,17 @@ struct InputLoad {
     uint32_t stalled_loops = 0; // work took longer than the driver can buffer (50 ms)
 };
 
+// How the audio to be played arrives from the server. The packets of one
+// reply are sent one frame duration apart, and the speaker has nothing else
+// to play: a packet that is late, or one that waits here because the decoder
+// did not get to it, is a hole in the sound.
+struct OutputFeed {
+    uint32_t packets = 0;
+    uint32_t late_packets = 0;   // came over half a frame after it was due
+    uint32_t max_gap_ms = 0;     // longest wait between two packets of one reply
+    uint32_t max_waiting = 0;    // most packets found still waiting to be decoded
+};
+
 class AudioService {
 public:
     AudioService();
@@ -170,6 +181,7 @@ public:
     void EnableDeviceAec(bool enable);
     EchoLevels GetEchoLevels(bool reset);
     InputLoad GetInputLoad(bool reset);
+    OutputFeed GetOutputFeed(bool reset);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
@@ -189,6 +201,9 @@ private:
     std::atomic<int64_t> reference_heard_us_{0};  // last time the reference carried signal
     InputLoad input_load_;
     void NoteInputLoad(int64_t wait_us, int64_t work_us);
+    OutputFeed output_feed_;
+    int64_t last_packet_us_ = 0;
+    void NoteIncomingPacket(size_t waiting);
     void NoteVoiceInput(const std::vector<int16_t>& interleaved);
     void NoteVoiceOutput(const std::vector<int16_t>& mono);
     std::unique_ptr<AudioProcessor> audio_processor_;

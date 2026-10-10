@@ -25,6 +25,7 @@ private:
     bool echo_reference_hooked_ = false;
 
     static bool OnI2sSent(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx);
+    static bool OnI2sSendOverflow(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx);
     static bool OnI2sReceived(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx);
     static bool OnI2sReceiveOverflow(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx);
 

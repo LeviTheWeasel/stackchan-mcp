@@ -742,8 +742,15 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
             return false;
         }
     }
+    const size_t waiting = audio_decode_queue_.size();
     audio_decode_queue_.push_back(std::move(packet));
     audio_queue_cv_.notify_all();
+    lock.unlock();
+    if (!wait) {
+        // Only what the server streams: a sound played from flash is pushed
+        // all at once by a caller that waits for room.
+        NoteIncomingPacket(waiting);
+    }
     return true;
 }
 
@@ -976,6 +983,35 @@ void AudioService::NoteInputLoad(int64_t wait_us, int64_t work_us) {
     if (work_us > 50 * 1000) {
         ++input_load_.stalled_loops;
     }
+}
+
+void AudioService::NoteIncomingPacket(size_t waiting) {
+    const int64_t now_us = esp_timer_get_time();
+    std::lock_guard<std::mutex> lock(echo_levels_mutex_);
+    ++output_feed_.packets;
+    if (waiting > output_feed_.max_waiting) {
+        output_feed_.max_waiting = (uint32_t)waiting;
+    }
+    // Packets over a second apart belong to different replies.
+    const int64_t gap_ms = (now_us - last_packet_us_) / 1000;
+    if (last_packet_us_ != 0 && gap_ms < 1000) {
+        if (gap_ms > output_feed_.max_gap_ms) {
+            output_feed_.max_gap_ms = (uint32_t)gap_ms;
+        }
+        if (gap_ms > decoder_duration_ms_ * 3 / 2) {
+            ++output_feed_.late_packets;
+        }
+    }
+    last_packet_us_ = now_us;
+}
+
+OutputFeed AudioService::GetOutputFeed(bool reset) {
+    std::lock_guard<std::mutex> lock(echo_levels_mutex_);
+    OutputFeed feed = output_feed_;
+    if (reset) {
+        output_feed_ = OutputFeed();
+    }
+    return feed;
 }
 
 InputLoad AudioService::GetInputLoad(bool reset) {

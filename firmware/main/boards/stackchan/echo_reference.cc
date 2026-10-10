@@ -44,6 +44,16 @@ void EchoReference::OnSent(const int16_t* samples, size_t stride, int64_t now_us
     // never look at frames at or past tx_frames_, and Process() keeps clear
     // of the oldest slots, which are the ones this copy lands on.
     const int64_t base = tx_frames_;
+    // A starved run ends with the first buffer the driver does not report as
+    // overflowed. That is known one interrupt late, here.
+    uint32_t ended_run = 0;
+    if (tx_overflowed_) {
+        tx_overflowed_ = false;
+        ++tx_starved_run_;
+    } else {
+        ended_run = tx_starved_run_;
+        tx_starved_run_ = 0;
+    }
     if (enabled_) {
         for (int i = 0; i < config_.frames_per_interrupt; ++i) {
             ring_[(base + i) & ring_mask_] = samples != nullptr ? samples[i * stride] : 0;
@@ -53,6 +63,25 @@ void EchoReference::OnSent(const int16_t* samples, size_t stride, int64_t now_us
     tx_frames_ = base + config_.frames_per_interrupt;
     tx_time_us_ = now_us;
     ++stats_.tx_interrupts;
+    if (ended_run > 0) {
+        const int64_t run_ms = (int64_t)ended_run * config_.frames_per_interrupt * 1000 / config_.sample_rate;
+        if (run_ms > 500) {
+            ++stats_.idle_runs;
+        } else {
+            stats_.dropout_buffers += ended_run;
+            if (run_ms <= 30) {
+                ++stats_.dropouts_30ms;
+            } else if (run_ms <= 100) {
+                ++stats_.dropouts_100ms;
+            } else {
+                ++stats_.dropouts_500ms;
+            }
+        }
+    }
+}
+
+void EchoReference::OnSendOverflow() {
+    tx_overflowed_ = true;
 }
 
 void EchoReference::OnReceived(int64_t now_us) {
