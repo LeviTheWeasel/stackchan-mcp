@@ -160,9 +160,13 @@ LISTEN_MODE_MANUAL = "manual"
 
 #: The microphone stays live while the device speaks, so the far side hears
 #: the guest talk over a reply and can interrupt it. Needs firmware that
-#: honours ``mode: "realtime"`` on listen.start *and* was built with device
-#: echo cancellation; firmware without either quietly behaves as manual.
+#: honours ``mode: "realtime"`` on listen.start *and* can cancel its own
+#: echo; :meth:`AgentsConversation._prepare_realtime` asks for the latter and
+#: falls back to manual when the device cannot.
 LISTEN_MODE_REALTIME = "realtime"
+
+#: Device tool that puts the echo canceller in or out of the voice path.
+ECHO_CANCELLATION_TOOL = "self.audio.set_echo_cancellation"
 
 
 def resolve_listen_mode(explicit: Any = None) -> str:
@@ -229,6 +233,10 @@ class AgentsConversation:
         self._agent_id = agent_id
         self._api_key = api_key
         self._listen_mode = listen_mode
+        # None until a realtime conversation has asked the device; then
+        # whether the device is cancelling its own echo for us.
+        self._echo_cancellation: bool | None = None
+        self._listen_mode_note: str | None = None
 
         self._recording_owner = _new_owner_token()
         self._decoder: StreamingOpusDecoder | None = None
@@ -279,6 +287,9 @@ class AgentsConversation:
             # manual. ``frames_uplinked`` climbing while a reply plays is
             # the evidence that the microphone really stayed open.
             "listen_mode": self._listen_mode,
+            # Set when the mode in use is not the one that was asked for.
+            "listen_mode_note": self._listen_mode_note,
+            "echo_cancellation": self._echo_cancellation,
             "started_at": self._started_at,
             "frames_uplinked": self._frames_uplinked,
             "frames_dropped": self._frames_dropped,
@@ -350,6 +361,8 @@ class AgentsConversation:
             # message opens the microphone for the whole conversation: the
             # device keeps capturing through its own speech and returns to
             # listening by itself when a reply ends.
+            if self._listen_mode == LISTEN_MODE_REALTIME:
+                await self._prepare_realtime()
             await self._gateway.esp32.send_listen_state(
                 "start", mode=self._listen_mode, profile="voice"
             )
@@ -400,6 +413,49 @@ class AgentsConversation:
                 "agent's audio format in its ElevenLabs configuration."
             )
 
+    async def _prepare_realtime(self) -> None:
+        """Have the device cancel its own echo, or give up on realtime.
+
+        A microphone left open beside a playing speaker sends every reply
+        back to the agent as if the guest had said it, and the agent
+        interrupts itself. The firmware refuses a realtime session without
+        echo cancellation for that reason and quietly runs a manual one
+        instead. Asking first means the conversation knows which it got and
+        says so, rather than reporting a mode the device declined.
+        """
+        problem = await self._set_echo_cancellation(True)
+        if problem is None:
+            self._echo_cancellation = True
+            return
+        self._echo_cancellation = False
+        self._listen_mode = LISTEN_MODE_MANUAL
+        self._listen_mode_note = (
+            f"realtime was requested; using manual because {problem}"
+        )
+        logger.warning("agents realtime listening unavailable: %s", problem)
+
+    async def _set_echo_cancellation(self, enabled: bool) -> str | None:
+        """Switch the device's echo canceller; return why not, or None if done."""
+        call_tool = getattr(self._gateway.esp32, "call_tool", None)
+        if call_tool is None:
+            return "this gateway cannot call device tools"
+        try:
+            result, error = await call_tool(ECHO_CANCELLATION_TOOL, {"enabled": enabled})
+        except Exception as exc:
+            return f"the echo cancellation call failed: {exc}"
+        if error:
+            # Firmware that predates the tool answers with an unknown-tool
+            # error, which is the common case of "cannot".
+            message = error.get("message") if isinstance(error, dict) else error
+            return f"the device refused echo cancellation ({message})"
+        payload: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            payload = json.loads(result["content"][0]["text"])
+        if payload.get("ok") is True and payload.get("enabled") is enabled:
+            return None
+        reason = payload.get("reason") or "the device did not confirm the switch"
+        return f"echo cancellation is unavailable ({reason})"
+
     def _arm_capture(self) -> None:
         connection = self._gateway.esp32.connection
         session_id = getattr(connection, "session_id", "") if connection else ""
@@ -440,6 +496,14 @@ class AgentsConversation:
             self._release_recording_slot()
             with contextlib.suppress(Exception):
                 await self._gateway.esp32.send_listen_state("stop")
+            if self._echo_cancellation:
+                # Back to how the device boots, so that everything outside a
+                # realtime conversation hears the microphone as before.
+                problem = await self._set_echo_cancellation(False)
+                if problem is None:
+                    self._echo_cancellation = False
+                else:
+                    logger.warning("agents could not switch echo cancellation off: %s", problem)
             if self._ws is not None:
                 with contextlib.suppress(Exception):
                     await self._ws.close()

@@ -1,5 +1,6 @@
 #include "wifi_board.h"
 #include "cores3_audio_codec.h"
+#include "echo_tools.h"
 #include "display/lcd_display.h"
 #include "application.h"
 #include "config.h"
@@ -7367,6 +7368,8 @@ private:
                                       STACKCHAN_CHARGE_AUTO != 0);
                 return root;
             });
+
+        RegisterEchoTools(mcp_server, static_cast<CoreS3AudioCodec*>(GetAudioCodec()));
 
         ESP_LOGI(TAG, "StackChan MCP tools registered");
     }

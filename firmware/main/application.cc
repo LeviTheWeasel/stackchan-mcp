@@ -1409,6 +1409,18 @@ void Application::SetAecMode(AecMode mode) {
     });
 }
 
+bool Application::SetDeviceAec(bool enable) {
+#if CONFIG_USE_SWITCHABLE_DEVICE_AEC
+    // aec_mode_ is also what lets a server-requested realtime session
+    // through (HandleStartListeningEvent), so the two change together.
+    aec_mode_ = enable ? kAecOnDeviceSide : kAecOff;
+    audio_service_.EnableDeviceAec(enable);
+    return true;
+#else
+    return false;
+#endif
+}
+
 void Application::PlaySound(const std::string_view& sound) {
     audio_service_.PlaySound(sound);
 }

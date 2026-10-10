@@ -20,6 +20,17 @@ class _FakeESP32:
         self.listen_lock = asyncio.Lock()
         self.listen_calls: list[tuple[str, str, str]] = []
         self.tts_calls: list[str] = []
+        self.tool_calls: list[tuple[str, dict[str, Any]]] = []
+        # What the device answers to a tool call: a (result, error) pair, or
+        # None for firmware that knows the echo cancellation tool.
+        self.tool_reply: tuple[Any, Any] | None = None
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> tuple[Any, Any]:
+        self.tool_calls.append((name, arguments))
+        if self.tool_reply is not None:
+            return self.tool_reply
+        payload = {"ok": True, "enabled": arguments["enabled"], "persistence": "until reboot"}
+        return {"content": [{"type": "text", "text": json.dumps(payload)}]}, None
 
     async def send_listen_state(
         self,
@@ -666,3 +677,67 @@ async def test_a_failed_abort_does_not_keep_the_reply_playing() -> None:
 
     assert task.cancelled()
     assert conv._playback_task is None
+
+
+@pytest.mark.asyncio
+async def test_realtime_switches_echo_cancellation_on_and_off_again() -> None:
+    gateway = _FakeGateway()
+    conv = _conversation(gateway, listen_mode="realtime")
+
+    await conv._prepare_realtime()
+
+    assert gateway.esp32.tool_calls == [("self.audio.set_echo_cancellation", {"enabled": True})]
+    assert conv.status()["listen_mode"] == "realtime"
+    assert conv.status()["echo_cancellation"] is True
+    assert conv.status()["listen_mode_note"] is None
+
+    conv._active = True
+    await conv.stop()
+
+    assert gateway.esp32.tool_calls[-1] == ("self.audio.set_echo_cancellation", {"enabled": False})
+    assert conv.status()["echo_cancellation"] is False
+
+
+@pytest.mark.asyncio
+async def test_realtime_becomes_manual_on_firmware_without_echo_cancellation() -> None:
+    gateway = _FakeGateway()
+    gateway.esp32.tool_reply = (None, {"code": -32601, "message": "Unknown tool"})
+    conv = _conversation(gateway, listen_mode="realtime")
+
+    await conv._prepare_realtime()
+
+    status = conv.status()
+    assert status["listen_mode"] == "manual"
+    assert status["echo_cancellation"] is False
+    assert "Unknown tool" in status["listen_mode_note"]
+
+    # Nothing was switched on, so stopping must not try to switch it off.
+    conv._active = True
+    await conv.stop()
+    assert len(gateway.esp32.tool_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_realtime_becomes_manual_when_the_device_cannot_switch_it_on() -> None:
+    gateway = _FakeGateway()
+    refusal = {"ok": False, "enabled": False, "reason": "software echo reference unavailable"}
+    gateway.esp32.tool_reply = ({"content": [{"type": "text", "text": json.dumps(refusal)}]}, None)
+    conv = _conversation(gateway, listen_mode="realtime")
+
+    await conv._prepare_realtime()
+
+    status = conv.status()
+    assert status["listen_mode"] == "manual"
+    assert "software echo reference unavailable" in status["listen_mode_note"]
+
+
+@pytest.mark.asyncio
+async def test_a_manual_conversation_never_touches_echo_cancellation() -> None:
+    gateway = _FakeGateway()
+    conv = _conversation(gateway)
+    conv._active = True
+
+    await conv.stop()
+
+    assert gateway.esp32.tool_calls == []
+    assert conv.status()["echo_cancellation"] is None

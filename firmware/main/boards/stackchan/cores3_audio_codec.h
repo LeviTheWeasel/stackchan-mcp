@@ -2,6 +2,7 @@
 #define _BOX_AUDIO_CODEC_H
 
 #include "audio_codec.h"
+#include "echo_reference.h"
 
 #include <esp_codec_dev.h>
 #include <esp_codec_dev_defaults.h>
@@ -18,6 +19,15 @@ private:
     esp_codec_dev_handle_t output_dev_ = nullptr;
     esp_codec_dev_handle_t input_dev_ = nullptr;
 
+    // Stands in for the speaker loopback this board does not have. Off until
+    // SetSoftwareReference(true); see echo_reference.h.
+    EchoReference echo_reference_;
+    bool echo_reference_hooked_ = false;
+
+    static bool OnI2sSent(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx);
+    static bool OnI2sReceived(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx);
+    static bool OnI2sReceiveOverflow(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx);
+
     void CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din);
 
     virtual int Read(int16_t* dest, int samples) override;
@@ -32,6 +42,12 @@ public:
     virtual void SetOutputVolume(int volume) override;
     virtual void EnableInput(bool enable) override;
     virtual void EnableOutput(bool enable) override;
+
+    // Replace capture channel 1 with a reference built from the samples sent
+    // to the speaker. Returns false, and changes nothing, when the I2S
+    // interrupts could not be hooked at start-up.
+    bool SetSoftwareReference(bool enable);
+    EchoReference& echo_reference() { return echo_reference_; }
 };
 
 #endif // _BOX_AUDIO_CODEC_H

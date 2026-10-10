@@ -2130,3 +2130,41 @@ async def test_set_charge_enabled_relays_to_esp32(monkeypatch):
     assert payload["ok"] is True
     assert payload["charge_enabled"] is False
     assert payload["persistence"] == "volatile_resets_on_boot"
+
+
+@pytest.mark.asyncio
+async def test_echo_tools_relay_to_the_firmware(monkeypatch):
+    """The echo cancellation tools map onto the firmware's self.audio.* tools."""
+    calls = []
+
+    class FakeESP32:
+        device_connected = True
+
+        async def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            return {"content": [{"type": "text", "text": json.dumps({"ok": True})}]}, None
+
+    class FakeGateway:
+        esp32 = FakeESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: FakeGateway())
+    server = create_server()
+
+    listed = await server.request_handlers[ListToolsRequest](ListToolsRequest(method="tools/list"))
+    names = {tool.name for tool in listed.root.tools}
+    assert {"set_echo_cancellation", "get_echo_stats", "echo_probe"} <= names
+
+    for name, arguments in (
+        ("set_echo_cancellation", {"enabled": True}),
+        ("get_echo_stats", {"reset": True}),
+        ("echo_probe", {"action": "arm"}),
+    ):
+        await server.request_handlers[CallToolRequest](
+            CallToolRequest(method="tools/call", params={"name": name, "arguments": arguments})
+        )
+
+    assert calls == [
+        ("self.audio.set_echo_cancellation", {"enabled": True}),
+        ("self.audio.get_echo_stats", {"reset": True}),
+        ("self.audio.echo_probe", {"action": "arm"}),
+    ]

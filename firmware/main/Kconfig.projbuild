@@ -925,6 +925,17 @@ config USE_DEVICE_AEC
     help
         To work properly, device-side AEC requires a clean output reference path from the speaker signal and physical acoustic isolation between the microphone and speaker.
 
+config USE_SWITCHABLE_DEVICE_AEC
+    bool "Device-Side AEC, off until switched on at runtime"
+    default n
+    depends on USE_AUDIO_PROCESSOR && BOARD_TYPE_STACKCHAN && !USE_DEVICE_AEC
+    help
+        Builds the echo canceller into the voice front end and leaves it off.
+        The firmware then behaves as it does without AEC until a caller
+        switches it on (self.audio.set_echo_cancellation), and goes back to
+        that on reboot. For boards whose echo reference is made in software
+        and has to be measured on the device before it is trusted.
+
 config USE_SERVER_AEC
     bool "Enable Server-Side AEC (Unstable)"
     default n

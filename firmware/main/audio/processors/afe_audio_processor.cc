@@ -59,6 +59,10 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
 #ifdef CONFIG_USE_DEVICE_AEC
     afe_config->aec_init = true;
     afe_config->vad_init = false;
+#elif CONFIG_USE_SWITCHABLE_DEVICE_AEC
+    // Both stages are built; EnableDeviceAec() chooses which one runs.
+    afe_config->aec_init = true;
+    afe_config->vad_init = true;
 #else
     afe_config->aec_init = false;
     afe_config->vad_init = true;
@@ -66,7 +70,13 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
 
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
-    
+
+#if CONFIG_USE_SWITCHABLE_DEVICE_AEC && !CONFIG_USE_DEVICE_AEC
+    // Start as a build without AEC does: the canceller exists but is not in
+    // the path until somebody asks for it.
+    afe_iface_->disable_aec(afe_data_);
+#endif
+
     xTaskCreate([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;
         this_->AudioProcessorTask();
@@ -188,7 +198,7 @@ void AfeAudioProcessor::AudioProcessorTask() {
 
 void AfeAudioProcessor::EnableDeviceAec(bool enable) {
     if (enable) {
-#if CONFIG_USE_DEVICE_AEC
+#if CONFIG_USE_DEVICE_AEC || CONFIG_USE_SWITCHABLE_DEVICE_AEC
         afe_iface_->disable_vad(afe_data_);
         afe_iface_->enable_aec(afe_data_);
 #else

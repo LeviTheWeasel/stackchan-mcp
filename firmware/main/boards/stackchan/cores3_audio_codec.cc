@@ -1,14 +1,31 @@
 #include "cores3_audio_codec.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <driver/i2c_master.h>
 #include <driver/i2s_tdm.h>
 
 #define TAG "CoreS3AudioCodec"
 
+namespace {
+
+EchoReference::Config EchoReferenceConfig(int sample_rate) {
+    EchoReference::Config config;
+    config.sample_rate = sample_rate;
+    config.frames_per_interrupt = AUDIO_CODEC_DMA_FRAME_NUM;
+    // The hold-back and the lead are lengths of time; the defaults are theirs
+    // at 24 kHz.
+    config.mic_delay_frames = config.mic_delay_frames * sample_rate / 24000;
+    config.lead_frames = config.lead_frames * sample_rate / 24000;
+    return config;
+}
+
+}  // namespace
+
 CoreS3AudioCodec::CoreS3AudioCodec(void* i2c_master_handle, int input_sample_rate, int output_sample_rate,
     gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
-    uint8_t aw88298_addr, uint8_t es7210_addr, bool input_reference) {
+    uint8_t aw88298_addr, uint8_t es7210_addr, bool input_reference)
+    : echo_reference_(EchoReferenceConfig(input_sample_rate)) {
     duplex_ = true; // 是否双工
     input_reference_ = input_reference; // 是否使用参考输入，实现回声消除
     input_channels_ = input_reference_ ? 2 : 1; // 输入通道数
@@ -177,6 +194,23 @@ void CoreS3AudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gp
 
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle_, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_init_tdm_mode(rx_handle_, &tdm_cfg));
+
+    // The driver only accepts callbacks before a channel is enabled. A
+    // refusal costs the software reference and nothing else, so it is
+    // reported and survived rather than treated like the calls around it.
+    i2s_event_callbacks_t tx_callbacks = {};
+    tx_callbacks.on_sent = OnI2sSent;
+    i2s_event_callbacks_t rx_callbacks = {};
+    rx_callbacks.on_recv = OnI2sReceived;
+    rx_callbacks.on_recv_q_ovf = OnI2sReceiveOverflow;
+    esp_err_t tx_hook = i2s_channel_register_event_callback(tx_handle_, &tx_callbacks, this);
+    esp_err_t rx_hook = i2s_channel_register_event_callback(rx_handle_, &rx_callbacks, this);
+    echo_reference_hooked_ = tx_hook == ESP_OK && rx_hook == ESP_OK;
+    if (!echo_reference_hooked_) {
+        ESP_LOGE(TAG, "I2S callbacks not registered (tx: %s, rx: %s); software echo reference unavailable",
+            esp_err_to_name(tx_hook), esp_err_to_name(rx_hook));
+    }
+
     ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle_));
     ESP_LOGI(TAG, "Duplex channels created");
@@ -204,6 +238,8 @@ void CoreS3AudioCodec::EnableInput(bool enable) {
         }
         ESP_ERROR_CHECK(esp_codec_dev_open(input_dev_, &fs));
         ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), input_gain_));
+        // Opening restarts the capture channel and empties its queue.
+        echo_reference_.Restart();
     } else {
         ESP_ERROR_CHECK(esp_codec_dev_close(input_dev_));
     }
@@ -233,9 +269,44 @@ void CoreS3AudioCodec::EnableOutput(bool enable) {
 
 int CoreS3AudioCodec::Read(int16_t* dest, int samples) {
     if (input_enabled_) {
+        echo_reference_.BeforeRead(esp_timer_get_time());
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_read(input_dev_, (void*)dest, samples * sizeof(int16_t)));
+        // Leaves the audio untouched unless the software reference is on.
+        echo_reference_.Process(dest, samples / input_channels_, input_channels_, esp_timer_get_time());
     }
     return samples;
+}
+
+bool CoreS3AudioCodec::SetSoftwareReference(bool enable) {
+    if (enable && (!echo_reference_hooked_ || input_channels_ < 2)) {
+        return false;
+    }
+    echo_reference_.SetEnabled(enable);
+    ESP_LOGI(TAG, "Software echo reference %s", enable ? "on" : "off");
+    return true;
+}
+
+bool CoreS3AudioCodec::OnI2sSent(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx) {
+    auto* self = static_cast<CoreS3AudioCodec*>(user_ctx);
+    // One DMA buffer is AUDIO_CODEC_DMA_FRAME_NUM frames whatever the slot
+    // layout, so its size says how many samples make a frame: one when the
+    // driver plays mono, two when it plays stereo. Either way the first is
+    // what the speaker gets.
+    const size_t stride = event->size / (AUDIO_CODEC_DMA_FRAME_NUM * sizeof(int16_t));
+    const bool known_layout = event->dma_buf != nullptr && (stride == 1 || stride == 2);
+    self->echo_reference_.OnSent(known_layout ? static_cast<const int16_t*>(event->dma_buf) : nullptr,
+        stride, esp_timer_get_time());
+    return false;
+}
+
+bool CoreS3AudioCodec::OnI2sReceived(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx) {
+    static_cast<CoreS3AudioCodec*>(user_ctx)->echo_reference_.OnReceived(esp_timer_get_time());
+    return false;
+}
+
+bool CoreS3AudioCodec::OnI2sReceiveOverflow(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx) {
+    static_cast<CoreS3AudioCodec*>(user_ctx)->echo_reference_.OnReceiveOverflow();
+    return false;
 }
 
 int CoreS3AudioCodec::Write(const int16_t* data, int samples) {

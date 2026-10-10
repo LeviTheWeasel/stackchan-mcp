@@ -111,6 +111,26 @@ struct DebugStatistics {
     uint32_t playback_count = 0;
 };
 
+// How loud the voice front end's input and output are, kept apart by whether
+// the speaker was playing. With the room otherwise quiet, the "playing"
+// figures are the echo before and after cancellation.
+//
+// "Playing" means the reference channel carried signal within the last 200 ms
+// (words have gaps), "quiet" that it has carried none for 500 ms (rooms have
+// tails); what falls between is counted as neither. Energies are sums of
+// squared 16 kHz samples.
+struct EchoLevels {
+    uint64_t mic_energy_playing = 0;
+    uint64_t reference_energy_playing = 0;
+    uint32_t input_samples_playing = 0;
+    uint64_t mic_energy_quiet = 0;
+    uint32_t input_samples_quiet = 0;
+    uint64_t output_energy_playing = 0;
+    uint32_t output_samples_playing = 0;
+    uint64_t output_energy_quiet = 0;
+    uint32_t output_samples_quiet = 0;
+};
+
 class AudioService {
 public:
     AudioService();
@@ -135,6 +155,7 @@ public:
     void EnableRawCapture(bool enable);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
+    EchoLevels GetEchoLevels(bool reset);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
@@ -148,6 +169,12 @@ public:
 private:
     AudioCodec* codec_ = nullptr;
     AudioServiceCallbacks callbacks_;
+
+    std::mutex echo_levels_mutex_;
+    EchoLevels echo_levels_;
+    std::atomic<int64_t> reference_heard_us_{0};  // last time the reference carried signal
+    void NoteVoiceInput(const std::vector<int16_t>& interleaved);
+    void NoteVoiceOutput(const std::vector<int16_t>& mono);
     std::unique_ptr<AudioProcessor> audio_processor_;
     std::unique_ptr<WakeWord> wake_word_;
     std::unique_ptr<AudioDebugger> audio_debugger_;

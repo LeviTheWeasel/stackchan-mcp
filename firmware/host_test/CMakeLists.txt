@@ -50,6 +50,21 @@ target_link_libraries(listening_profile_test
     PRIVATE GTest::gtest_main
 )
 
+add_executable(echo_reference_test
+    test_echo_reference.cc
+    ../main/boards/stackchan/echo_reference.cc
+)
+
+target_include_directories(echo_reference_test
+    PRIVATE
+        ../main/boards/stackchan
+)
+
+target_link_libraries(echo_reference_test
+    PRIVATE GTest::gtest_main
+)
+
 include(GoogleTest)
 gtest_discover_tests(mdns_candidate_extract_test)
 gtest_discover_tests(listening_profile_test)
+gtest_discover_tests(echo_reference_test)

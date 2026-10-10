@@ -106,6 +106,7 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
+        NoteVoiceOutput(data);
         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
     });
 
@@ -293,6 +294,7 @@ void AudioService::AudioInputTask() {
                 if (bits & AS_EVENT_RAW_CAPTURE_RUNNING) {
                     FeedRawCapture(std::move(data));
                 } else if (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING) {
+                    NoteVoiceInput(data);
                     audio_processor_->Feed(std::move(data));
                 }
                 continue;
@@ -870,6 +872,85 @@ void AudioService::EnableDeviceAec(bool enable) {
     }
 
     audio_processor_->EnableDeviceAec(enable);
+}
+
+namespace {
+
+// Reference louder than this, as mean square per sample, counts as the
+// speaker playing. The software reference is exact zero when it is not.
+constexpr uint64_t kReferenceHeardMeanSquare = 20 * 20;
+constexpr int64_t kPlayingHoldUs = 200 * 1000;
+constexpr int64_t kQuietAfterUs = 500 * 1000;
+
+enum class EchoPhase { kPlaying, kQuiet, kBetween };
+
+EchoPhase EchoPhaseAt(int64_t now_us, int64_t reference_heard_us) {
+    if (reference_heard_us != 0 && now_us - reference_heard_us <= kPlayingHoldUs) {
+        return EchoPhase::kPlaying;
+    }
+    if (reference_heard_us == 0 || now_us - reference_heard_us >= kQuietAfterUs) {
+        return EchoPhase::kQuiet;
+    }
+    return EchoPhase::kBetween;
+}
+
+}  // namespace
+
+void AudioService::NoteVoiceInput(const std::vector<int16_t>& interleaved) {
+    if (codec_->input_channels() != 2 || !codec_->input_reference() || interleaved.size() < 2) {
+        return;
+    }
+    uint64_t mic_energy = 0;
+    uint64_t reference_energy = 0;
+    const size_t frames = interleaved.size() / 2;
+    for (size_t i = 0; i < frames; ++i) {
+        const int32_t mic = interleaved[2 * i];
+        const int32_t reference = interleaved[2 * i + 1];
+        mic_energy += (uint64_t)(mic * mic);
+        reference_energy += (uint64_t)(reference * reference);
+    }
+    const int64_t now_us = esp_timer_get_time();
+    if (reference_energy > kReferenceHeardMeanSquare * frames) {
+        reference_heard_us_.store(now_us, std::memory_order_relaxed);
+    }
+    const auto phase = EchoPhaseAt(now_us, reference_heard_us_.load(std::memory_order_relaxed));
+    std::lock_guard<std::mutex> lock(echo_levels_mutex_);
+    if (phase == EchoPhase::kPlaying) {
+        echo_levels_.mic_energy_playing += mic_energy;
+        echo_levels_.reference_energy_playing += reference_energy;
+        echo_levels_.input_samples_playing += frames;
+    } else if (phase == EchoPhase::kQuiet) {
+        echo_levels_.mic_energy_quiet += mic_energy;
+        echo_levels_.input_samples_quiet += frames;
+    }
+}
+
+void AudioService::NoteVoiceOutput(const std::vector<int16_t>& mono) {
+    if (codec_->input_channels() != 2 || !codec_->input_reference()) {
+        return;
+    }
+    uint64_t energy = 0;
+    for (const int32_t sample : mono) {
+        energy += (uint64_t)(sample * sample);
+    }
+    const auto phase = EchoPhaseAt(esp_timer_get_time(), reference_heard_us_.load(std::memory_order_relaxed));
+    std::lock_guard<std::mutex> lock(echo_levels_mutex_);
+    if (phase == EchoPhase::kPlaying) {
+        echo_levels_.output_energy_playing += energy;
+        echo_levels_.output_samples_playing += mono.size();
+    } else if (phase == EchoPhase::kQuiet) {
+        echo_levels_.output_energy_quiet += energy;
+        echo_levels_.output_samples_quiet += mono.size();
+    }
+}
+
+EchoLevels AudioService::GetEchoLevels(bool reset) {
+    std::lock_guard<std::mutex> lock(echo_levels_mutex_);
+    EchoLevels levels = echo_levels_;
+    if (reset) {
+        echo_levels_ = EchoLevels();
+    }
+    return levels;
 }
 
 void AudioService::SetCallbacks(AudioServiceCallbacks& callbacks) {

@@ -1138,6 +1138,18 @@ async def _dispatch_mcp_tool(
             "self.touch.get_touch_state",
             {},
         ),
+        "set_echo_cancellation": (
+            "self.audio.set_echo_cancellation",
+            arguments,
+        ),
+        "get_echo_stats": (
+            "self.audio.get_echo_stats",
+            arguments,
+        ),
+        "echo_probe": (
+            "self.audio.echo_probe",
+            arguments,
+        ),
         "set_led": (
             "self.led.set_color",
             arguments,
@@ -2011,6 +2023,77 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         },
                     },
                     "required": ["enabled", "timeout_ms"],
+                },
+            ),
+            Tool(
+                name="set_echo_cancellation",
+                description=(
+                    "Switch the device's echo cancellation on or off. On, the "
+                    "robot removes its own speech from the microphone signal, "
+                    "using the samples given to the speaker as reference, and "
+                    "accepts realtime listening (microphone live while it "
+                    "speaks). Off is the state after every boot; the setting "
+                    "is not persisted. agents_converse_start with "
+                    "listen_mode=\"realtime\" switches it on for the "
+                    "conversation and off afterwards, so this is for "
+                    "measuring, not for everyday use."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": "True to cancel echo; false for the boot state.",
+                        },
+                    },
+                    "required": ["enabled"],
+                },
+            ),
+            Tool(
+                name="get_echo_stats",
+                description=(
+                    "Read how echo cancellation is doing: whether the software "
+                    "reference is tied to the microphone clock (reference."
+                    "synced and .located), and the sound level before and "
+                    "after the voice front end, kept apart for moments when "
+                    "the speaker was playing and when it was quiet. With "
+                    "nobody talking, echo_reduction_db is how much of its own "
+                    "voice the robot removes; quiet_reduction_db is what the "
+                    "front end does to a quiet room regardless. Levels "
+                    "accumulate while the device listens."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "reset": {
+                            "type": "boolean",
+                            "description": "Clear the accumulated levels after reading them.",
+                            "default": False,
+                        },
+                    },
+                },
+            ),
+            Tool(
+                name="echo_probe",
+                description=(
+                    "Record a third of a second of what the echo canceller is "
+                    "given while the robot speaks, and report how the "
+                    "microphone relates to the reference. action=\"arm\" "
+                    "waits for the next playback (echo cancellation must be on "
+                    "and the device listening); action=\"result\" returns "
+                    "the state, or the analysis once it is done. A usable "
+                    "reference shows mic_vs_reference.lag_ms positive and a "
+                    "few milliseconds long."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["arm", "result"],
+                            "default": "result",
+                        },
+                    },
                 },
             ),
             Tool(

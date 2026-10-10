@@ -123,6 +123,10 @@ public:
     void SendJsonString(const std::string& json_str);
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
+    // Put the device-side echo canceller in or out of the voice path without
+    // the notification and channel close SetAecMode() does. Main task only.
+    // Returns false when the firmware was not built to switch it.
+    bool SetDeviceAec(bool enable);
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
     
