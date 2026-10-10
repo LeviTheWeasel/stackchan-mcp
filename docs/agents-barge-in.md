@@ -15,9 +15,10 @@ own voice for the guest's. This branch does both: a realtime listening mode,
 and echo cancellation on the device to make it usable.
 
 **State: works on a robot.** A guest talking over a reply stops it, with the
-canceller in `voip_low_cost` and the microphone audio amplified by 12 dB on
-its way to the agent. Getting there took more than keeping the microphone
-open; "How loud the agent needs it" is the part that was missing.
+canceller in `voip_low_cost` (the firmware's default for this board) and the
+microphone audio amplified by 12 dB on its way to the agent. Getting there
+took more than keeping the microphone open; "How loud the agent needs it" is
+the part that was missing.
 
 ## How the echo is cancelled
 
@@ -69,6 +70,18 @@ test_echo_reference.cc` runs each of those against simulated interrupts.
 - `self.audio.set_echo_cancellation {enabled}` switches the software
   reference and the canceller together. Not persisted: a reboot is always a
   way back to the stock audio path.
+- The canceller's mode is `voip_low_cost` unless another one is stored.
+  `self.audio.set_echo_options` stores how the voice front end is built (the
+  canceller's mode and filter length, noise suppression, the cores it runs
+  on) in NVS for the next boot. `{reset: true}` clears all of it, and
+  `get_echo_stats` shows what the next boot will use under `options`.
+  `voip_high_perf`, which the front end uses on other boards, costs more
+  than this one has while it speaks: the capture task took about 90 % of
+  core 0, about 5 % of capture buffers were dropped and 15 s of speech
+  played with about 60 holes. In `voip_low_cost` 0.2 % were dropped, there
+  were about 10 holes, and 35 to 40 dB of echo was removed. Both were
+  measured on the robot on 2026-10-10 with the mode stored in NVS; the build
+  in which `voip_low_cost` is the default has not run on a robot yet.
 - `self.audio.get_echo_stats` and `self.audio.echo_probe` measure the result
   (below).
 - `{"type":"tts","state":"abort"}` drops the audio already buffered on the
@@ -89,8 +102,8 @@ test_echo_reference.cc` runs each of those against simulated interrupts.
   cancels playback.
 - The per-turn re-arm is still sent in realtime mode. New firmware ignores it
   while listening; old firmware needs it.
-- New tools `set_echo_cancellation`, `get_echo_stats`, `echo_probe` relay to
-  the firmware tools of the same names.
+- New tools `set_echo_cancellation`, `get_echo_stats`, `echo_probe` and
+  `set_echo_options` relay to the firmware tools of the same names.
 
 ## First flash (2026-10-10): AEC silenced the microphone
 

@@ -2,6 +2,7 @@
 
 #include "application.h"
 #include "cores3_audio_codec.h"
+#include "echo_options.h"
 #include "echo_reference.h"
 #include "mcp_server.h"
 #include "settings.h"
@@ -124,7 +125,7 @@ void AddStoredOptions(cJSON* parent) {
     Settings settings("echo", false);
     cJSON* options = cJSON_AddObjectToObject(parent, "options");
     cJSON_AddStringToObject(options, "aec_mode",
-        AecModeToName(settings.GetInt("aec_mode", AEC_MODE_VOIP_HIGH_PERF)));
+        AecModeToName(settings.GetInt("aec_mode", kSwitchableAecDefaultMode)));
     cJSON_AddNumberToObject(options, "filter_length", settings.GetInt("filter_len", 0));
     cJSON_AddBoolToObject(options, "noise_suppression", settings.GetBool("ns", true));
     cJSON_AddNumberToObject(options, "input_core", settings.GetInt("in_core", 0));

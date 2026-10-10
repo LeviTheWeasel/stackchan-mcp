@@ -1,4 +1,5 @@
 #include "afe_audio_processor.h"
+#include "echo_options.h"
 #include "settings.h"
 #include <esp_log.h>
 
@@ -69,9 +70,11 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         // found by measuring on the device, so the choices that are fixed
         // when the front end is created come from settings (written by
         // self.audio.set_echo_options, applied on the next boot). With
-        // nothing stored this is the configuration above.
+        // nothing stored this is the configuration above, except for the
+        // canceller's mode: see kSwitchableAecDefaultMode.
         Settings settings("echo", false);
-        int aec_mode = settings.GetInt("aec_mode", AEC_MODE_VOIP_HIGH_PERF);
+        afe_config->aec_mode = kSwitchableAecDefaultMode;
+        int aec_mode = settings.GetInt("aec_mode", kSwitchableAecDefaultMode);
         if (aec_mode == AEC_MODE_SR_LOW_COST || aec_mode == AEC_MODE_SR_HIGH_PERF ||
             aec_mode == AEC_MODE_VOIP_LOW_COST || aec_mode == AEC_MODE_VOIP_HIGH_PERF) {
             afe_config->aec_mode = (aec_mode_t)aec_mode;
