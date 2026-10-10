@@ -987,3 +987,162 @@ async def test_start_ends_a_leftover_listening_session_before_opening_its_own(
         assert sent_at[1] - sent_at[0] >= 0.04
     finally:
         await conv.stop()
+
+
+# --- what the agent is sent: level and gain --------------------------
+
+
+def _tone(level: int, samples: int = 960) -> bytes:
+    """A frame of 16-bit PCM whose RMS is exactly ``level``."""
+    return b"".join(
+        (level if index % 2 else -level).to_bytes(2, "little", signed=True)
+        for index in range(samples)
+    )
+
+
+class _PassThroughDecoder:
+    """The frames in these tests are already PCM."""
+
+    def decode_frame(self, frame: bytes) -> bytes:
+        return frame
+
+
+async def _uplink(conv: AgentsConversation, frames: list[bytes]) -> list[bytes]:
+    """Run frames through the uplink loop; returns the PCM the agent was sent."""
+    conv._ws = _FakeWS()
+    conv._decoder = _PassThroughDecoder()
+    task = asyncio.create_task(conv._uplink_loop())
+    try:
+        before = conv.status()["frames_uplinked"]
+        for frame in frames:
+            conv._on_opus_frame(frame)
+        await _wait_until(lambda: conv.status()["frames_uplinked"] == before + len(frames))
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    return [base64.b64decode(json.loads(sent)["user_audio_chunk"]) for sent in conv._ws.sent]
+
+
+def test_uplink_gain_is_zero_unless_asked_otherwise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("STACKCHAN_AGENTS_UPLINK_GAIN_DB", raising=False)
+    assert agents_mode.resolve_uplink_gain_db() == 0.0
+
+    monkeypatch.setenv("STACKCHAN_AGENTS_UPLINK_GAIN_DB", " 6 ")
+    assert agents_mode.resolve_uplink_gain_db() == 6.0
+    # An explicit request beats the environment, and so does an explicit 0.
+    assert agents_mode.resolve_uplink_gain_db(9.5) == 9.5
+    assert agents_mode.resolve_uplink_gain_db(0) == 0.0
+    assert agents_mode.resolve_uplink_gain_db("") == 6.0
+
+
+@pytest.mark.parametrize("bad", ["loud", "nan", 31, -13, True])
+def test_an_uplink_gain_that_makes_no_sense_is_refused(
+    monkeypatch: pytest.MonkeyPatch, bad: Any
+) -> None:
+    monkeypatch.delenv("STACKCHAN_AGENTS_UPLINK_GAIN_DB", raising=False)
+    with pytest.raises(ValueError):
+        agents_mode.resolve_uplink_gain_db(bad)
+
+
+@pytest.mark.asyncio
+async def test_without_gain_the_agent_gets_the_audio_as_the_device_sent_it() -> None:
+    conv = _conversation()
+    frame = _tone(300)
+
+    sent = await _uplink(conv, [frame])
+
+    assert sent == [frame]
+    assert conv.status()["uplink_gain_db"] == 0.0
+    assert conv.status()["uplink_clipped_samples"] == 0
+
+
+@pytest.mark.asyncio
+async def test_gain_amplifies_what_the_agent_gets_but_not_what_is_reported() -> None:
+    conv = AgentsConversation(
+        _FakeGateway(), agent_id="agent_test", api_key="key_test", uplink_gain_db=20.0
+    )
+    # Nine frames: half a second and a little, so the loudest-half-second
+    # figure has a whole block to work with.
+    sent = await _uplink(conv, [_tone(150)] * 9)
+
+    assert sent[0] == _tone(1500)
+    levels = conv.status()["uplink_levels"]["between_replies"]
+    # Levels stay comparable with the device's own figures.
+    assert levels["rms"] == 150
+    assert levels["loudest_half_second_rms"] == 150
+    assert levels["seconds"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_gain_that_overshoots_is_clipped_and_counted() -> None:
+    conv = AgentsConversation(
+        _FakeGateway(), agent_id="agent_test", api_key="key_test", uplink_gain_db=20.0
+    )
+
+    sent = await _uplink(conv, [_tone(5000, samples=10)])
+
+    full_scale = b"".join(
+        value.to_bytes(2, "little", signed=True) for value in (-32768, 32767) * 5
+    )
+    assert sent == [full_scale]
+    assert conv.status()["uplink_clipped_samples"] == 10
+
+
+@pytest.mark.asyncio
+async def test_uplink_levels_are_kept_apart_for_replies_and_the_gaps_between(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conv = _conversation()
+
+    await _uplink(conv, [_tone(40)] * 9)
+
+    # A reply is playing: the echo that got through, then the guest
+    # talking over it for half a second, then echo again.
+    conv._reply_playing = True
+    await _uplink(conv, [_tone(60)] * 9 + [_tone(400)] * 9 + [_tone(60)] * 9)
+    conv._reply_playing = False
+    conv._reply_stopped_at = agents_mode.time.monotonic()
+
+    # The device is still emptying its buffer; this belongs to neither.
+    await _uplink(conv, [_tone(3000)] * 9)
+
+    monkeypatch.setattr(agents_mode, "UPLINK_LEVEL_TAIL_S", 0.0)
+    await _uplink(conv, [_tone(40)] * 9)
+
+    levels = conv.status()["uplink_levels"]
+    assert levels["between_replies"] == {
+        "seconds": 1.1,
+        "rms": 40,
+        "loudest_half_second_rms": 40,
+    }
+    assert levels["while_reply_plays"]["seconds"] == 1.6
+    # The whole reply averages the guest away; the loudest half second
+    # is where they show.
+    assert levels["while_reply_plays"]["rms"] < 250
+    assert levels["while_reply_plays"]["loudest_half_second_rms"] > 350
+
+
+@pytest.mark.asyncio
+async def test_a_reply_marks_its_own_start_and_end_for_the_levels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conv = _conversation()
+    seen: list[str | None] = []
+
+    async def _stream(_gateway: Any, chunks: Any, **_kwargs: Any) -> None:
+        async for _chunk in chunks:
+            seen.append(conv._uplink_phase())
+
+    monkeypatch.setattr(agents_mode, "send_pcm_stream", _stream)
+    assert conv._uplink_phase() == "between_replies"
+
+    await conv._playback_queue.put(None)
+    await conv._play_turn(b"\x00\x00" * 480)
+
+    assert seen == ["while_reply_plays"]
+    assert conv._uplink_phase() is None
+    monkeypatch.setattr(agents_mode, "UPLINK_LEVEL_TAIL_S", 0.0)
+    assert conv._uplink_phase() == "between_replies"

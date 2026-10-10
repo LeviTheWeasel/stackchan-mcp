@@ -14,8 +14,9 @@ is that the microphone then hears the robot, and the agent takes the robot's
 own voice for the guest's. This branch does both: a realtime listening mode,
 and echo cancellation on the device to make it usable.
 
-**State: built, covered by host and gateway tests, not yet run on a robot.**
-See "What has not been verified".
+**State: runs on a robot; the echo is cancelled and the agent can be
+interrupted by a loud enough sound, but a person talking over a reply has not
+yet been heard.** See "How loud the agent needs it" for where that stands.
 
 ## How the echo is cancelled
 
@@ -180,6 +181,47 @@ reference replaces. A correlation with the microphone near 1 at 0 ms means it
 is a second microphone; a correlation with the reference near 1 means the
 board has a loopback after all and could use it directly.
 
+## How loud the agent needs it
+
+Dialled directly, with synthetic speech in place of the microphone, the agent
+has a level below which speech is silence to it. Levels are the RMS of 16-bit
+samples while speaking.
+
+| what it was sent | what it did |
+|---|---|
+| a question at 470, then an utterance at 470 or 250 over its reply | answered, and stopped within half a second of being talked over |
+| the same utterance at 150 over its reply | carried on; nothing transcribed |
+| a question at 150 in a quiet line | nothing; treated the guest as absent |
+| its own reply coming back at 600 or 2500, nobody speaking | interrupted itself within about a second, every time |
+
+On the robot, a person at the desk reaches the microphone at roughly 470
+between replies. While the robot speaks, the canceller in `voip_low_cost`
+takes its own voice from about 5000 down to 20..100, and lets a sound that is
+not in the speaker signal through 2 to 10 dB weaker than it would in a quiet
+room (measured with the head servos as the sound: 650 between replies, 230 to
+440 during one). A voice thinned out like that sits at the agent's threshold,
+which matches what was seen: with clean capture and 34 dB of echo removed, a
+guest talking over three replies was not heard once.
+
+That the path itself works was shown by switching the canceller off in the
+middle of a reply: the robot's own voice went up the line and the agent
+interrupted within three seconds.
+
+Two things in the gateway address this:
+
+- `agents_converse_status` reports `uplink_levels`: for the stretches when a
+  reply was playing and for the stretches between replies, the level of the
+  microphone audio over the whole of it and its loudest half second. With
+  nobody talking, `while_reply_plays` is the echo that was left. When the
+  guest talks over a reply, the loudest half second is their voice as the
+  agent got it.
+- `uplink_gain_db` on `agents_converse_start` (or
+  `STACKCHAN_AGENTS_UPLINK_GAIN_DB`) amplifies the microphone audio before
+  the agent gets it. It lifts the leftover echo by the same amount, so the
+  room for it is what lies between the echo and the voice: lower the speaker
+  volume to widen it. Raise the gain until `interruptions` rises with nobody
+  talking, then go back by 6 dB.
+
 ## Turn it on
 
 On the gateway host, add to the gateway's environment and restart it:
@@ -199,6 +241,7 @@ Then read `agents_converse_status` during a conversation:
 | `listen_mode_note` | set if realtime was asked for and refused | `null` |
 | `echo_cancellation` | `null` or `false` | `true` |
 | `frames_uplinked` | stops growing while the robot speaks | keeps growing while the robot speaks |
+| `uplink_levels.while_reply_plays` | `seconds` stays near 0 | `loudest_half_second_rms` jumps when you talk over a reply |
 | `interruptions` | `0` | goes up when you talk over a reply |
 
 ## Go back

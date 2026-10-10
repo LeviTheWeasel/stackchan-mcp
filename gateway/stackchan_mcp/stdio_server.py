@@ -783,6 +783,7 @@ async def _handle_agents_converse_start(
         gateway,
         agent_id=arguments.get("agent_id"),
         listen_mode=arguments.get("listen_mode"),
+        uplink_gain_db=arguments.get("uplink_gain_db"),
     )
     return _follow_pose_text({"ok": True, **status})
 
@@ -2829,6 +2830,24 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                                 "cancellation and behaves as 'manual' "
                                 "without it. Defaults to "
                                 "STACKCHAN_AGENTS_LISTEN_MODE, then 'manual'."
+                            ),
+                        },
+                        "uplink_gain_db": {
+                            "type": "number",
+                            "minimum": -12,
+                            "maximum": 30,
+                            "description": (
+                                "Decibels by which the microphone audio is "
+                                "amplified before the agent gets it. The "
+                                "agent treats speech below a certain level "
+                                "as silence, which is where a voice lands "
+                                "once the echo canceller has thinned it "
+                                "out mid-reply; the same gain lifts the "
+                                "echo that was left, and an agent that "
+                                "hears its own reply interrupts itself. "
+                                "Read uplink_levels in agents_converse_"
+                                "status to choose. Defaults to "
+                                "STACKCHAN_AGENTS_UPLINK_GAIN_DB, then 0."
                             ),
                         },
                     },

@@ -48,12 +48,16 @@ background tasks that are cancelled on stop.
 
 from __future__ import annotations
 
+import array
 import asyncio
 import base64
 import contextlib
 import json
 import logging
+import math
 import os
+import sys
+import time
 from itertools import count
 from typing import Any
 
@@ -173,6 +177,24 @@ LISTEN_MODE_REALTIME = "realtime"
 #: Device tool that puts the echo canceller in or out of the voice path.
 ECHO_CANCELLATION_TOOL = "self.audio.set_echo_cancellation"
 
+#: The stretch over which the loudest moment of the uplink is taken: half a
+#: second, about one short word.
+UPLINK_LEVEL_BLOCK_SAMPLES = DEVICE_SAMPLE_RATE // 2
+
+#: Microphone audio that arrives this soon after a reply stopped is counted
+#: in neither half of the conversation: the device still has the end of the
+#: reply in its buffer, so it is not yet a quiet room.
+UPLINK_LEVEL_TAIL_S = 0.5
+
+#: Limits for the uplink gain. Past the upper one a quiet room is already
+#: speech to the far side; the lower one exists so that a typo cannot mute
+#: the guest.
+UPLINK_GAIN_MIN_DB = -12.0
+UPLINK_GAIN_MAX_DB = 30.0
+
+UPLINK_WHILE_REPLY_PLAYS = "while_reply_plays"
+UPLINK_BETWEEN_REPLIES = "between_replies"
+
 
 def resolve_listen_mode(explicit: Any = None) -> str:
     """How the microphone is held for a conversation.
@@ -191,6 +213,126 @@ def resolve_listen_mode(explicit: Any = None) -> str:
             f"Unknown listen mode {raw!r}: use {LISTEN_MODE_MANUAL!r} or {LISTEN_MODE_REALTIME!r}."
         )
     return mode
+
+
+def resolve_uplink_gain_db(explicit: Any = None) -> float:
+    """How much the microphone audio is amplified on its way to the agent.
+
+    An explicit value wins, then ``STACKCHAN_AGENTS_UPLINK_GAIN_DB``, then 0
+    (the audio is passed on as the device sent it).
+
+    The far side has a level below which speech is silence to it: dialled
+    directly, the agent answered and let itself be interrupted at an RMS of
+    250 and did neither at 150. A voice the device's echo canceller has
+    thinned out while the device was speaking can land under that line,
+    and then the guest cannot interrupt however the microphone is held.
+    The same gain lifts whatever echo the canceller left, and an agent that
+    hears its own reply (it did at 600) interrupts itself, so the value has
+    to be found with ``uplink_levels`` in the status, not guessed.
+    """
+    raw: Any = explicit
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = os.getenv("STACKCHAN_AGENTS_UPLINK_GAIN_DB", "")
+    if isinstance(raw, str) and not raw.strip():
+        return 0.0
+    try:
+        if isinstance(raw, bool):
+            raise ValueError
+        gain = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"Uplink gain {raw!r} is not a number of decibels.") from None
+    if not math.isfinite(gain) or not (UPLINK_GAIN_MIN_DB <= gain <= UPLINK_GAIN_MAX_DB):
+        raise ValueError(
+            f"Uplink gain {raw!r} dB is outside {UPLINK_GAIN_MIN_DB:g}..{UPLINK_GAIN_MAX_DB:g}."
+        )
+    return gain
+
+
+class UplinkLevels:
+    """How loud the microphone audio is, apart for the two halves of a conversation.
+
+    Whether the guest can interrupt comes down to what reaches the agent
+    while the device is speaking, and nothing else in the status says: the
+    frame counter climbs just the same for silence. This keeps, for the
+    stretches when a reply was playing and for the stretches between
+    replies, the level over the whole of it and the loudest half second.
+
+    With nobody talking, ``while_reply_plays`` is the echo that got past the
+    device's canceller. When the guest talks over a reply, the loudest half
+    second there is their voice as the agent received it, and
+    ``between_replies`` is the same voice with nothing in its way.
+
+    Levels are of the audio as the device sent it, before any gain.
+    """
+
+    def __init__(self) -> None:
+        self._energy = {UPLINK_WHILE_REPLY_PLAYS: 0, UPLINK_BETWEEN_REPLIES: 0}
+        self._samples = {UPLINK_WHILE_REPLY_PLAYS: 0, UPLINK_BETWEEN_REPLIES: 0}
+        self._loudest = {UPLINK_WHILE_REPLY_PLAYS: 0.0, UPLINK_BETWEEN_REPLIES: 0.0}
+        self._block_phase: str | None = None
+        self._block_energy = 0
+        self._block_samples = 0
+
+    def note(self, phase: str | None, energy: int, samples: int) -> None:
+        """Account for one frame; ``phase`` None leaves it out of both halves."""
+        if phase != self._block_phase:
+            # A half second that straddles the start or end of a reply is
+            # neither one thing nor the other.
+            self._block_phase = phase
+            self._block_energy = 0
+            self._block_samples = 0
+        if phase is None or samples <= 0:
+            return
+        self._energy[phase] += energy
+        self._samples[phase] += samples
+        self._block_energy += energy
+        self._block_samples += samples
+        if self._block_samples >= UPLINK_LEVEL_BLOCK_SAMPLES:
+            level = math.sqrt(self._block_energy / self._block_samples)
+            self._loudest[phase] = max(self._loudest[phase], level)
+            self._block_energy = 0
+            self._block_samples = 0
+
+    def report(self) -> dict[str, Any]:
+        return {
+            phase: {
+                "seconds": round(self._samples[phase] / DEVICE_SAMPLE_RATE, 1),
+                "rms": round(math.sqrt(self._energy[phase] / self._samples[phase]))
+                if self._samples[phase]
+                else 0,
+                "loudest_half_second_rms": round(self._loudest[phase]),
+            }
+            for phase in (UPLINK_WHILE_REPLY_PLAYS, UPLINK_BETWEEN_REPLIES)
+        }
+
+
+def measure_and_amplify(pcm: bytes, factor: float) -> tuple[bytes, int, int, int]:
+    """Level of one frame of 16-bit PCM, and the frame amplified.
+
+    Returns ``(pcm, energy, samples, clipped)``: the audio to send, the sum
+    of squares and the number of samples of what came in, and how many
+    samples the gain pushed past full scale. A factor of 1 returns the
+    bytes it was given.
+    """
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - len(pcm) % 2])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    energy = sum(sample * sample for sample in samples)
+    if factor == 1.0:
+        return pcm, energy, len(samples), 0
+    clipped = 0
+    out = array.array("h", bytes(2 * len(samples)))
+    for index, sample in enumerate(samples):
+        value = round(sample * factor)
+        if value > 32767:
+            value, clipped = 32767, clipped + 1
+        elif value < -32768:
+            value, clipped = -32768, clipped + 1
+        out[index] = value
+    if sys.byteorder == "big":
+        out.byteswap()
+    return out.tobytes(), energy, len(samples), clipped
 
 
 async def fetch_signed_url(agent_id: str, api_key: str, *, timeout_s: float = 20.0) -> str:
@@ -233,11 +375,20 @@ class AgentsConversation:
         agent_id: str,
         api_key: str,
         listen_mode: str = LISTEN_MODE_MANUAL,
+        uplink_gain_db: float = 0.0,
     ) -> None:
         self._gateway = gateway
         self._agent_id = agent_id
         self._api_key = api_key
         self._listen_mode = listen_mode
+        self._uplink_gain_db = uplink_gain_db
+        self._uplink_factor = 10.0 ** (uplink_gain_db / 20.0)
+        self._uplink_levels = UplinkLevels()
+        self._uplink_clipped_samples = 0
+        # Whether a reply is being fed to the speaker, and when the last
+        # one stopped: what sorts the uplink into its two halves.
+        self._reply_playing = False
+        self._reply_stopped_at: float | None = None
         # None until a realtime conversation has asked the device; then
         # whether the device is cancelling its own echo for us.
         self._echo_cancellation: bool | None = None
@@ -298,6 +449,13 @@ class AgentsConversation:
             "started_at": self._started_at,
             "frames_uplinked": self._frames_uplinked,
             "frames_dropped": self._frames_dropped,
+            # What those frames carried. A realtime conversation whose
+            # ``while_reply_plays`` never rises above its echo when the
+            # guest talks over a reply cannot be interrupted, whatever
+            # ``frames_uplinked`` does.
+            "uplink_levels": self._uplink_levels.report(),
+            "uplink_gain_db": self._uplink_gain_db,
+            "uplink_clipped_samples": self._uplink_clipped_samples,
             "audio_chunks_received": self._audio_chunks_received,
             "interruptions": self._interruptions,
             "turns_played": self._turns_played,
@@ -580,6 +738,9 @@ class AgentsConversation:
                 continue
             if not pcm:
                 continue
+            pcm, energy, samples, clipped = measure_and_amplify(pcm, self._uplink_factor)
+            self._uplink_levels.note(self._uplink_phase(), energy, samples)
+            self._uplink_clipped_samples += clipped
             payload = json.dumps(
                 {"user_audio_chunk": base64.b64encode(pcm).decode("ascii")}
             )
@@ -590,6 +751,21 @@ class AgentsConversation:
                 logger.warning("agents uplink send failed: %s", exc)
                 return
             self._frames_uplinked += 1
+
+    def _uplink_phase(self) -> str | None:
+        """Which half of the conversation a frame arriving now belongs to.
+
+        Told by what this side is doing, which runs a little ahead of the
+        speaker: a reply counts from its ``tts.start``, a few frames before
+        the first sound, and the stretch just after it is left out because
+        the device is still playing what it buffered.
+        """
+        if self._reply_playing:
+            return UPLINK_WHILE_REPLY_PLAYS
+        stopped = self._reply_stopped_at
+        if stopped is not None and time.monotonic() - stopped < UPLINK_LEVEL_TAIL_S:
+            return None
+        return UPLINK_BETWEEN_REPLIES
 
     # --- downlink (agent -> device speaker) -------------------------
 
@@ -877,6 +1053,7 @@ class AgentsConversation:
                     return
                 yield chunk
 
+        self._reply_playing = True
         try:
             await send_pcm_stream(
                 self._gateway,
@@ -890,6 +1067,9 @@ class AgentsConversation:
         except Exception as exc:
             self._last_error = f"playback failed: {exc}"
             logger.warning("agents playback failed: %s", exc)
+        finally:
+            self._reply_playing = False
+            self._reply_stopped_at = time.monotonic()
 
 
 # --- module-level lifecycle ------------------------------------------
@@ -907,6 +1087,7 @@ async def start_agents_conversation(
     *,
     agent_id: Any = None,
     listen_mode: Any = None,
+    uplink_gain_db: Any = None,
 ) -> dict[str, Any]:
     global _mode
     async with _get_mode_lock():
@@ -917,6 +1098,7 @@ async def start_agents_conversation(
             agent_id=resolve_agent_id(agent_id),
             api_key=resolve_api_key(),
             listen_mode=resolve_listen_mode(listen_mode),
+            uplink_gain_db=resolve_uplink_gain_db(uplink_gain_db),
         )
         _mode = mode
         try:
