@@ -27,6 +27,14 @@ by whichever of the two arrives first, and failing both, by
 bug -- the device stays in its speaking state, which mutes its own
 microphone, so the conversation dies silently with counters at zero.
 
+Whether the guest can interrupt depends on how the microphone is held,
+:func:`resolve_listen_mode`. In ``manual`` mode (the default, and all that
+older firmware knows) the device is deaf while it speaks: the far side's
+interruption handling is intact but never hears anything to act on. In
+``realtime`` mode the firmware keeps capturing through its own speech with
+echo cancellation, so talking over a reply reaches the agent, which answers
+with an ``interruption`` event, and the reply is cut on the device.
+
 The device speaks Opus at :data:`DEVICE_SAMPLE_RATE`; the agent is
 configured for ``pcm_16000`` in both directions, so the only conversion
 needed is Opus<->PCM — no resampling. :func:`start` refuses to run if the
@@ -145,6 +153,37 @@ def resolve_agent_id(explicit: Any = None) -> str:
     )
 
 
+#: The microphone is opened for the stretch between replies and re-armed
+#: after each one. The device is deaf while it speaks; this is what every
+#: firmware build understands and what the mode did before realtime existed.
+LISTEN_MODE_MANUAL = "manual"
+
+#: The microphone stays live while the device speaks, so the far side hears
+#: the guest talk over a reply and can interrupt it. Needs firmware that
+#: honours ``mode: "realtime"`` on listen.start *and* was built with device
+#: echo cancellation; firmware without either quietly behaves as manual.
+LISTEN_MODE_REALTIME = "realtime"
+
+
+def resolve_listen_mode(explicit: Any = None) -> str:
+    """How the microphone is held for a conversation.
+
+    An explicit value wins, then ``STACKCHAN_AGENTS_LISTEN_MODE``, then
+    manual. An unknown value is an error rather than a silent fallback: the
+    two modes differ in whether the guest can be heard mid-reply, and that
+    should never be decided by a typo.
+    """
+    raw = explicit if isinstance(explicit, str) and explicit.strip() else os.getenv(
+        "STACKCHAN_AGENTS_LISTEN_MODE", ""
+    )
+    mode = raw.strip().lower() or LISTEN_MODE_MANUAL
+    if mode not in (LISTEN_MODE_MANUAL, LISTEN_MODE_REALTIME):
+        raise ValueError(
+            f"Unknown listen mode {raw!r}: use {LISTEN_MODE_MANUAL!r} or {LISTEN_MODE_REALTIME!r}."
+        )
+    return mode
+
+
 async def fetch_signed_url(agent_id: str, api_key: str, *, timeout_s: float = 20.0) -> str:
     """Get a short-lived signed WebSocket URL for a private agent.
 
@@ -178,10 +217,18 @@ async def fetch_signed_url(agent_id: str, api_key: str, *, timeout_s: float = 20
 class AgentsConversation:
     """One live conversation between the device and an ElevenLabs agent."""
 
-    def __init__(self, gateway: Any, *, agent_id: str, api_key: str) -> None:
+    def __init__(
+        self,
+        gateway: Any,
+        *,
+        agent_id: str,
+        api_key: str,
+        listen_mode: str = LISTEN_MODE_MANUAL,
+    ) -> None:
         self._gateway = gateway
         self._agent_id = agent_id
         self._api_key = api_key
+        self._listen_mode = listen_mode
 
         self._recording_owner = _new_owner_token()
         self._decoder: StreamingOpusDecoder | None = None
@@ -227,6 +274,11 @@ class AgentsConversation:
             "active": self._active,
             "agent_id": self._agent_id,
             "conversation_id": self._conversation_id,
+            # What was asked of the device, not proof of what it does:
+            # firmware that predates realtime listening treats it as
+            # manual. ``frames_uplinked`` climbing while a reply plays is
+            # the evidence that the microphone really stayed open.
+            "listen_mode": self._listen_mode,
             "started_at": self._started_at,
             "frames_uplinked": self._frames_uplinked,
             "frames_dropped": self._frames_dropped,
@@ -286,14 +338,20 @@ class AgentsConversation:
             # the agent hears echo-cancelled speech instead of its own
             # voice; beat mode uses profile="raw" for the opposite reason.
             #
-            # It does *not* keep the mic open across playback. Measured
-            # against firmware 2.2.6: the device stops sending frames the
-            # moment it enters the speaking state, and comes back to idle
-            # rather than to listening when the turn ends. So this
-            # listen.start only covers the window before the agent's first
-            # reply -- ``_rearm_listening`` owns every window after it.
+            # In manual mode it does *not* keep the mic open across
+            # playback. Measured against firmware 2.2.6: the device stops
+            # sending frames the moment it enters the speaking state, and
+            # comes back to idle rather than to listening when the turn
+            # ends. So this listen.start only covers the window before the
+            # agent's first reply -- ``_rearm_listening`` owns every window
+            # after it.
+            #
+            # In realtime mode, on firmware that supports it, this one
+            # message opens the microphone for the whole conversation: the
+            # device keeps capturing through its own speech and returns to
+            # listening by itself when a reply ends.
             await self._gateway.esp32.send_listen_state(
-                "start", mode="manual", profile="voice"
+                "start", mode=self._listen_mode, profile="voice"
             )
         except BaseException:
             self._release_recording_slot()
@@ -467,6 +525,17 @@ class AgentsConversation:
             # reciting a reply the far side has already retracted.
             self._interruptions += 1
             self._drain_playback_queue()
+            if self._listen_mode == LISTEN_MODE_REALTIME:
+                # Cancelling playback stops us *sending* audio; it does not
+                # unplay what the device has already buffered, which can be
+                # a couple of seconds of the sentence being interrupted.
+                # ``abort`` tells the firmware to drop that buffer. Sent
+                # first so the speaker falls silent before the tts.stop
+                # that the cancelled stream emits on its way out. Firmware
+                # that does not know the state ignores it, and a failure
+                # must not stop the cancellation below.
+                with contextlib.suppress(Exception):
+                    await self._gateway.esp32.send_tts_state("abort")
             await self._cancel_playback()
             return
 
@@ -611,6 +680,12 @@ class AgentsConversation:
         A failure is logged rather than raised. The outbound direction
         still works, and letting this kill the playback loop would turn a
         deaf conversation into a mute one as well.
+
+        It runs in realtime mode too, on purpose. Firmware that supports
+        realtime is already listening by the time this arrives and ignores
+        the message; firmware that does not has fallen back to manual and
+        needs it exactly as before. Sending it either way means a gateway
+        configured for realtime never leaves an older device deaf.
         """
         if not self._active:
             # ``stop`` clears the flag before it cancels these tasks, so
@@ -618,7 +693,7 @@ class AgentsConversation:
             return
         try:
             await self._gateway.esp32.send_listen_state(
-                "start", mode="manual", profile="voice"
+                "start", mode=self._listen_mode, profile="voice"
             )
         except Exception as exc:
             self._last_error = f"listen re-arm failed: {exc}"
@@ -703,6 +778,7 @@ async def start_agents_conversation(
     gateway: Any,
     *,
     agent_id: Any = None,
+    listen_mode: Any = None,
 ) -> dict[str, Any]:
     global _mode
     async with _get_mode_lock():
@@ -712,6 +788,7 @@ async def start_agents_conversation(
             gateway,
             agent_id=resolve_agent_id(agent_id),
             api_key=resolve_api_key(),
+            listen_mode=resolve_listen_mode(listen_mode),
         )
         _mode = mode
         try:

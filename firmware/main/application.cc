@@ -37,6 +37,18 @@ ListeningProfile ParseListenProfile(const cJSON* root) {
     return result.profile;
 }
 
+// ``mode`` of a server-driven listen.start. Only "realtime" changes anything:
+// it asks for a full-duplex session in which the microphone stays live while
+// the device speaks. Everything else, including a missing or malformed field,
+// is the manual-stop capture the gateway has always driven.
+ListeningMode ParseListenMode(const cJSON* root) {
+    auto mode = cJSON_GetObjectItem(root, "mode");
+    if (cJSON_IsString(mode) && strcmp(mode->valuestring, "realtime") == 0) {
+        return kListeningModeRealtime;
+    }
+    return kListeningModeManualStop;
+}
+
 } // namespace
 
 
@@ -570,7 +582,18 @@ void Application::InitializeProtocol() {
                         // gateway-driven push-to-talk, etc.). Loop-style
                         // Listening→Speaking→Listening flows belong on
                         // the gateway side, not in this firmware.
-                        SetDeviceState(kDeviceStateIdle);
+                        //
+                        // The one exception is a realtime session the
+                        // gateway asked for explicitly (listen.start with
+                        // mode "realtime"). There the microphone never
+                        // stopped: the reply was played with voice
+                        // processing and echo cancellation still running,
+                        // so going back to Listening changes nothing about
+                        // what is captured -- it only keeps the state
+                        // honest. The boundary is still the gateway's: the
+                        // session ends on its listen.stop.
+                        SetDeviceState(server_realtime_session_ ? kDeviceStateListening
+                                                                : kDeviceStateIdle);
                     }
                     // Phase 4 audio (Issue #76): stop the avatar mouth
                     // animation unconditionally on tts.stop. A wake-word /
@@ -581,6 +604,23 @@ void Application::InitializeProtocol() {
                     // ended and the mouth animation must still stop.
                     // OnTtsStop() is idempotent (no-op for boards without
                     // an avatar / when lip-sync is already stopped).
+                    board.OnTtsStop();
+                });
+            } else if (strcmp(state->valuestring, "abort") == 0) {
+                // The gateway is cutting a reply short: the far side heard
+                // the guest talk over it. tts.stop alone would not do --
+                // it ends the utterance but lets the frames already
+                // buffered here play out, up to a couple of seconds of a
+                // sentence the speaker has been told to drop. Clearing the
+                // decode and playback queues is what makes the robot
+                // actually fall silent when it is interrupted.
+                Schedule([this, &board]() {
+                    aborted_ = true;
+                    audio_service_.ResetDecoder();
+                    if (GetDeviceState() == kDeviceStateSpeaking) {
+                        SetDeviceState(server_realtime_session_ ? kDeviceStateListening
+                                                                : kDeviceStateIdle);
+                    }
                     board.OnTtsStop();
                 });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
@@ -606,21 +646,26 @@ void Application::InitializeProtocol() {
             // voice path; ``raw`` bypasses AFE and streams pre-AFE mic
             // PCM through the same Opus SendAudio path.
             //
-            // Phase 1 honours only ``state: "start" | "stop"``; the ``mode``
-            // field is parsed but currently ignored because
-            // ``HandleStartListeningEvent()`` unconditionally calls
-            // ``SetListeningMode(kListeningModeManualStop)``. Manual-stop is
-            // also the right default for gateway-driven capture: the gateway
-            // controls the exact stop boundary by issuing
+            // ``mode`` is "manual" unless the message says "realtime".
+            // Manual-stop is the right default for gateway-driven capture:
+            // the gateway controls the exact stop boundary by issuing
             // ``{"type":"listen","state":"stop"}`` after its capture window.
-            // Threading ``auto`` / ``realtime`` mode through is a follow-up.
+            //
+            // "realtime" opens a full-duplex session for conversation: the
+            // microphone stays live while a reply plays, so the far side can
+            // hear the guest talk over it and interrupt. It is honoured only
+            // when echo cancellation is available (see
+            // ``HandleStartListeningEvent``); without it the device would
+            // hear its own speaker and interrupt itself. ``auto`` is still
+            // not threaded through.
             auto state = cJSON_GetObjectItem(root, "state");
             if (!cJSON_IsString(state)) {
                 ESP_LOGW(TAG, "listen message missing state");
             } else if (strcmp(state->valuestring, "start") == 0) {
                 auto profile = ParseListenProfile(root);
-                Schedule([this, profile]() {
-                    StartListening(profile);
+                auto mode = ParseListenMode(root);
+                Schedule([this, profile, mode]() {
+                    StartListening(profile, mode);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 StopListening();
@@ -749,9 +794,10 @@ void Application::ToggleChatState() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT);
 }
 
-uint32_t Application::BeginListeningRequest(ListeningProfile profile) {
+uint32_t Application::BeginListeningRequest(ListeningProfile profile, ListeningMode mode) {
     uint32_t generation = listening_request_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
     pending_listening_profile_.store(profile, std::memory_order_release);
+    pending_listening_mode_.store(mode, std::memory_order_release);
     pending_listening_generation_.store(generation, std::memory_order_release);
     return generation;
 }
@@ -759,6 +805,7 @@ uint32_t Application::BeginListeningRequest(ListeningProfile profile) {
 void Application::InvalidatePendingListeningRequest() {
     listening_request_generation_.fetch_add(1, std::memory_order_acq_rel);
     pending_listening_profile_.store(kListeningProfileVoice, std::memory_order_release);
+    pending_listening_mode_.store(kListeningModeManualStop, std::memory_order_release);
     pending_listening_generation_.store(0, std::memory_order_release);
 }
 
@@ -767,12 +814,12 @@ bool Application::IsListeningRequestCurrent(uint32_t generation) const {
         listening_request_generation_.load(std::memory_order_acquire) == generation;
 }
 
-void Application::StartListening(ListeningProfile profile) {
+void Application::StartListening(ListeningProfile profile, ListeningMode mode) {
     // Thin event setter. The popup-on-listening flag is armed inside
     // HandleStartListeningEvent (main task) so all writes to
     // play_popup_on_listening_ converge to the same task that reads
     // and clears it in HandleStateChangedEvent.
-    BeginListeningRequest(profile);
+    BeginListeningRequest(profile, mode);
     xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING);
 }
 
@@ -868,8 +915,19 @@ void Application::HandleStartListeningEvent() {
     }
 
     auto requested_profile = pending_listening_profile_.load(std::memory_order_acquire);
+    auto requested_mode = pending_listening_mode_.load(std::memory_order_acquire);
+    if (requested_mode == kListeningModeRealtime && aec_mode_ == kAecOff) {
+        // A live microphone next to a playing speaker, with nothing
+        // removing the speaker from what it hears, feeds the reply straight
+        // back to the far side as if the guest had said it. Refuse the
+        // session rather than build that loop; manual-stop is what a
+        // gateway gets from firmware that predates this mode anyway.
+        ESP_LOGW(TAG, "Realtime listening needs echo cancellation, which is off; using manual stop");
+        requested_mode = kListeningModeManualStop;
+    }
     if (state == kDeviceStateIdle || state == kDeviceStateSpeaking) {
         listening_profile_ = requested_profile;
+        server_realtime_session_ = requested_mode == kListeningModeRealtime;
 
         // Arm the OGG_POPUP cue that HandleStateChangedEvent plays after
         // the kDeviceStateListening branch resets the decoder
@@ -892,21 +950,25 @@ void Application::HandleStartListeningEvent() {
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
-            Schedule([this, requested_generation]() {
-                ContinueOpenAudioChannel(kListeningModeManualStop, requested_generation);
+            Schedule([this, requested_mode, requested_generation]() {
+                ContinueOpenAudioChannel(requested_mode, requested_generation);
             });
             return;
         }
-        SetListeningMode(kListeningModeManualStop);
+        SetListeningMode(requested_mode);
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
-        SetListeningMode(kListeningModeManualStop);
+        SetListeningMode(requested_mode);
     }
 }
 
 void Application::HandleStopListeningEvent() {
     auto state = GetDeviceState();
-    
+    // listen.stop ends a realtime session whatever the device is doing. If
+    // a reply is still playing, its tts.stop must find the flag already
+    // cleared and take the device to Idle instead of back to Listening.
+    server_realtime_session_ = false;
+
     if (state == kDeviceStateAudioTesting) {
         audio_service_.EnableAudioTesting(false);
         SetDeviceState(kDeviceStateWifiConfiguring);
@@ -1038,6 +1100,11 @@ void Application::HandleStateChangedEvent() {
             audio_service_.EnableRawCapture(false);
             audio_service_.EnableVoiceProcessing(false);
             listening_profile_ = ListeningProfileAfterStop(listening_profile_);
+            // However the device got here -- listen.stop, a dropped
+            // channel, an error -- a realtime session does not survive
+            // Idle. Left set, the next ordinary TTS utterance would end by
+            // opening the microphone on a room nobody asked to record.
+            server_realtime_session_ = false;
             audio_service_.EnableWakeWordDetection(true);
             break;
         case kDeviceStateConnecting:

@@ -19,6 +19,7 @@ class _FakeESP32:
         self.connection = SimpleNamespace(protocol_version=1, session_id="conv-session")
         self.listen_lock = asyncio.Lock()
         self.listen_calls: list[tuple[str, str, str]] = []
+        self.tts_calls: list[str] = []
 
     async def send_listen_state(
         self,
@@ -27,6 +28,9 @@ class _FakeESP32:
         profile: str = "voice",
     ) -> None:
         self.listen_calls.append((state, mode, profile))
+
+    async def send_tts_state(self, state: str) -> None:
+        self.tts_calls.append(state)
 
 
 class _FakeGateway:
@@ -54,11 +58,12 @@ class _FakeWS:
         self.closed = True
 
 
-def _conversation(gateway: Any = None) -> AgentsConversation:
+def _conversation(gateway: Any = None, *, listen_mode: str = "manual") -> AgentsConversation:
     return AgentsConversation(
         gateway or _FakeGateway(),
         agent_id="agent_test",
         api_key="key_test",
+        listen_mode=listen_mode,
     )
 
 
@@ -551,3 +556,113 @@ async def test_stop_is_idempotent_on_an_inactive_conversation() -> None:
     conv = _conversation()
     status = await conv.stop()
     assert status["active"] is False
+
+
+# --- listen mode: can the guest be heard while the device speaks? ----
+
+
+def test_listen_mode_is_manual_unless_asked_otherwise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("STACKCHAN_AGENTS_LISTEN_MODE", raising=False)
+    assert agents_mode.resolve_listen_mode() == "manual"
+
+    monkeypatch.setenv("STACKCHAN_AGENTS_LISTEN_MODE", " Realtime ")
+    assert agents_mode.resolve_listen_mode() == "realtime"
+    # An explicit argument beats the environment, in both directions.
+    assert agents_mode.resolve_listen_mode("manual") == "manual"
+
+    monkeypatch.delenv("STACKCHAN_AGENTS_LISTEN_MODE")
+    assert agents_mode.resolve_listen_mode("realtime") == "realtime"
+
+
+def test_an_unknown_listen_mode_is_refused_not_guessed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STACKCHAN_AGENTS_LISTEN_MODE", "duplex")
+    with pytest.raises(ValueError, match="duplex"):
+        agents_mode.resolve_listen_mode()
+
+
+@pytest.mark.asyncio
+async def test_rearm_asks_for_the_mode_the_conversation_was_started_in() -> None:
+    gateway = _FakeGateway()
+    conv = _conversation(gateway, listen_mode="realtime")
+    conv._active = True
+
+    await conv._rearm_listening()
+
+    # Sent in realtime mode too: firmware that supports it ignores the
+    # message while listening, firmware that does not needs it to hear
+    # anything after the first reply.
+    assert gateway.esp32.listen_calls == [("start", "realtime", "voice")]
+    assert conv.status()["listen_mode"] == "realtime"
+
+
+@pytest.mark.asyncio
+async def test_interruption_in_realtime_mode_empties_the_device_buffer_first() -> None:
+    gateway = _FakeGateway()
+    conv = _conversation(gateway, listen_mode="realtime")
+    conv._playback_queue.put_nowait(b"stale")
+
+    started = asyncio.Event()
+
+    async def _never_ending() -> None:
+        started.set()
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(_never_ending())
+    conv._playback_task = task
+    await started.wait()
+
+    still_playing_when_abort_was_sent: list[bool] = []
+
+    async def _record(state: str) -> None:
+        gateway.esp32.tts_calls.append(state)
+        still_playing_when_abort_was_sent.append(not task.done())
+
+    gateway.esp32.send_tts_state = _record  # type: ignore[method-assign]
+
+    await conv._handle_event({"type": "interruption", "interruption_event": {"event_id": 1}})
+
+    # ``abort`` goes out while the stream is still open, so the speaker is
+    # silenced before the cancelled stream's own tts.stop arrives.
+    assert gateway.esp32.tts_calls == ["abort"]
+    assert still_playing_when_abort_was_sent == [True]
+    assert task.cancelled()
+    assert conv._playback_queue.empty()
+    assert conv.status()["interruptions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_interruption_in_manual_mode_sends_no_abort() -> None:
+    gateway = _FakeGateway()
+    conv = _conversation(gateway)
+
+    await conv._handle_event({"type": "interruption", "interruption_event": {"event_id": 1}})
+
+    assert gateway.esp32.tts_calls == []
+    assert conv.status()["interruptions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_abort_does_not_keep_the_reply_playing() -> None:
+    gateway = _FakeGateway()
+    conv = _conversation(gateway, listen_mode="realtime")
+
+    async def _never_ending() -> None:
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(_never_ending())
+    conv._playback_task = task
+    await asyncio.sleep(0)
+
+    async def _boom(state: str) -> None:
+        raise ConnectionError("device went away")
+
+    gateway.esp32.send_tts_state = _boom  # type: ignore[method-assign]
+
+    await conv._handle_event({"type": "interruption", "interruption_event": {"event_id": 1}})
+
+    assert task.cancelled()
+    assert conv._playback_task is None

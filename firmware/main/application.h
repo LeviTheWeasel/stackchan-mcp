@@ -100,7 +100,8 @@ public:
      * Start listening (event-based, thread-safe)
      * Sends MAIN_EVENT_START_LISTENING to be handled in Run()
      */
-    void StartListening(ListeningProfile profile = kListeningProfileVoice);
+    void StartListening(ListeningProfile profile = kListeningProfileVoice,
+                        ListeningMode mode = kListeningModeManualStop);
 
     /**
      * Stop listening (event-based, thread-safe)
@@ -144,6 +145,7 @@ private:
     DeviceStateMachine state_machine_;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     std::atomic<ListeningProfile> pending_listening_profile_{kListeningProfileVoice};
+    std::atomic<ListeningMode> pending_listening_mode_{kListeningModeManualStop};
     std::atomic<uint32_t> pending_listening_generation_{0};
     std::atomic<uint32_t> listening_request_generation_{0};
     ListeningProfile listening_profile_ = kListeningProfileVoice;
@@ -156,6 +158,12 @@ private:
     bool aborted_ = false;
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+    // True while the gateway holds the device in a realtime (full-duplex)
+    // listening session: the microphone stays live through TTS playback and
+    // the device returns to Listening, not Idle, when a reply ends. Main task
+    // only. Set by a server-driven listen.start with mode "realtime", cleared
+    // by listen.stop.
+    bool server_realtime_session_ = false;
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
@@ -169,7 +177,8 @@ private:
     void HandleNetworkDisconnectedEvent();
     void HandleActivationDoneEvent();
     void HandleWakeWordDetectedEvent();
-    uint32_t BeginListeningRequest(ListeningProfile profile);
+    uint32_t BeginListeningRequest(ListeningProfile profile,
+                                   ListeningMode mode = kListeningModeManualStop);
     void InvalidatePendingListeningRequest();
     bool IsListeningRequestCurrent(uint32_t generation) const;
     void ContinueOpenAudioChannel(ListeningMode mode, uint32_t generation);

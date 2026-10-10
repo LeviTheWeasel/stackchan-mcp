@@ -780,7 +780,9 @@ async def _handle_agents_converse_start(
     from .agents_mode import start_agents_conversation
 
     status = await start_agents_conversation(
-        gateway, agent_id=arguments.get("agent_id")
+        gateway,
+        agent_id=arguments.get("agent_id"),
+        listen_mode=arguments.get("listen_mode"),
     )
     return _follow_pose_text({"ok": True, **status})
 
@@ -2681,6 +2683,20 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                                 "ElevenLabs agent id. Defaults to "
                                 "STACKCHAN_ELEVEN_AGENT_ID in the gateway "
                                 "environment."
+                            ),
+                        },
+                        "listen_mode": {
+                            "type": "string",
+                            "enum": ["manual", "realtime"],
+                            "description": (
+                                "How the microphone is held. 'manual' opens "
+                                "it between replies, so the device is deaf "
+                                "while it speaks. 'realtime' keeps it live "
+                                "through playback so the user can interrupt; "
+                                "it needs firmware built with device echo "
+                                "cancellation and behaves as 'manual' "
+                                "without it. Defaults to "
+                                "STACKCHAN_AGENTS_LISTEN_MODE, then 'manual'."
                             ),
                         },
                     },
