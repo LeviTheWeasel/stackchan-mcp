@@ -14,9 +14,10 @@ is that the microphone then hears the robot, and the agent takes the robot's
 own voice for the guest's. This branch does both: a realtime listening mode,
 and echo cancellation on the device to make it usable.
 
-**State: runs on a robot; the echo is cancelled and the agent can be
-interrupted by a loud enough sound, but a person talking over a reply has not
-yet been heard.** See "How loud the agent needs it" for where that stands.
+**State: works on a robot.** A guest talking over a reply stops it, with the
+canceller in `voip_low_cost` and the microphone audio amplified by 12 dB on
+its way to the agent. Getting there took more than keeping the microphone
+open; "How loud the agent needs it" is the part that was missing.
 
 ## How the echo is cancelled
 
@@ -221,6 +222,29 @@ Two things in the gateway address this:
   room for it is what lies between the echo and the voice: lower the speaker
   volume to widen it. Raise the gain until `interruptions` rises with nobody
   talking, then go back by 6 dB.
+
+Measured on the robot at speaker volume 70, nobody talking, one call per
+gain (`while_reply_plays` multiplied by the gain, so as the agent got it):
+
+| gain | echo left, whole reply / loudest half second | agent interrupted itself |
+|---|---|---|
+| 0 dB | 84 / 232 | no |
+| 6 dB | 104 / 305 | no |
+| 12 dB | 311 / 1119 | no |
+| 18 dB | 485 / 1493 | no |
+
+What the canceller leaves is not speech to the agent even well above the
+level at which its own clean voice sets it off, so the ceiling is higher than
+the direct calls suggested. These calls only cover replies of 8 to 13 s.
+
+With 12 dB a guest then interrupted four replies in one call, each followed
+in the transcript by what they had said, and nothing interrupted the robot
+while nobody spoke (59 s of replies). Before the gain their voice was 541 at
+its loudest between replies and 235 to 593 over a reply: the first
+interruption sat at the agent's threshold without it.
+
+The price is that the agent hears the room better too: a second voice or a
+television that used to be silence to it may now be answered.
 
 ## Turn it on
 
