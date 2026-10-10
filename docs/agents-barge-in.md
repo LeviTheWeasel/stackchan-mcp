@@ -26,10 +26,10 @@ This branch makes the microphone stay live through playback.
 - New `{"type":"tts","state":"abort"}`: drop the audio already buffered on the
   device. `tts.stop` ends an utterance but lets buffered frames play out, which
   is up to a couple of seconds of a sentence that was supposed to stop.
-- The StackChan build now compiles device-side AEC in
-  (`CONFIG_USE_DEVICE_AEC=y`, and the board added to that option's allowed
-  list). The CoreS3 codec already delivers the speaker reference channel
-  (`AUDIO_INPUT_REFERENCE true`); upstream simply never enabled AEC for it.
+- Device-side AEC is **not** enabled for the StackChan build. The first
+  version of this branch did enable it, and it broke the microphone; see
+  "First flash" below. Until the board has a real echo reference, realtime
+  requests are refused by the firmware and the robot stays half-duplex.
 
 **Gateway**
 
@@ -42,6 +42,28 @@ This branch makes the microphone stay live through playback.
   while listening; old firmware needs it. A gateway set to realtime therefore
   cannot leave an un-flashed device deaf.
 - `agents_converse_status` reports `listen_mode`.
+
+## First flash (2026-10-10): AEC silenced the microphone
+
+Commit 702d754 built the StackChan firmware with `CONFIG_USE_DEVICE_AEC=y`.
+On the robot the microphone still produced frames (`listen()` returned 65
+frames for 3.9 s) but nothing in them could be transcribed: three
+conversations, in manual and in realtime mode, were recorded by the agent as
+silence while the guest was speaking.
+
+The likely cause is in `boards/stackchan/cores3_audio_codec.cc`. The ES7210 is
+set up with MIC1, MIC2 and MIC3 on a four-slot TDM bus, and capture opens
+channels 0 and 1. `AUDIO_INPUT_REFERENCE true` then labels channel 1 as the
+echo reference, but channel 1 is the second microphone, not the speaker
+loopback. Without AEC the audio front end ignores the reference, which is why
+the stock build works. With AEC it subtracts one microphone from the other, and
+a voice that reaches both is exactly what gets removed. This reading comes from
+the code and the symptoms; the captured audio level was not measured.
+
+So AEC is off again in this branch, and the realtime plumbing stays in as dead
+weight until someone establishes which ES7210 input, if any, carries the
+speaker signal on the CoreS3 (MIC3 is the candidate) and feeds that to the AFE
+as the reference.
 
 ## What has not been verified
 
