@@ -779,6 +779,9 @@ private:
     // Reactions auto-revert to "idle" after REACTION_HOLD_MS (3 s). A
     // post-reaction COOLDOWN_MS lock-out prevents one head-pat from firing
     // a chain of events.
+    // The face, the wobble and the revert are the board's own reaction and
+    // can be switched off (touch_reaction_enabled_) for a host that answers
+    // touches itself; the gesture is detected and reported either way.
     enum class TouchEvent : uint8_t {
         IDLE = 0,
         TAP,
@@ -807,6 +810,7 @@ private:
     static constexpr int SERVO_WOBBLE_AMPLITUDE_DEG = 20;
 
     std::atomic<bool> touch_sensor_enabled_{true};
+    std::atomic<bool> touch_reaction_enabled_{true};
     std::unique_ptr<Si12T> si12t_;
     bool si12t_ok_ = false;
     esp_timer_handle_t touch_poll_timer_ = nullptr;
@@ -4246,8 +4250,13 @@ private:
     // Re-arming overwrites any pending revert. Skipped while the avatar
     // has been hidden via set_avatar("off"), so a stale revert timer
     // does not re-cover the LCD after the user explicitly hid it.
+    // Skipped as well when the reaction was switched off after the revert
+    // was armed: whoever switched it off owns the face from then on.
     static void TouchRevertCb(void* arg) {
         StackChanBoard* self = static_cast<StackChanBoard*>(arg);
+        if (!self->touch_reaction_enabled_.load(std::memory_order_acquire)) {
+            return;
+        }
         self->SetAvatarExpressionIfActive("idle");
     }
 
@@ -4303,10 +4312,12 @@ private:
         LogTouchEvent("TAP", duration_ms);
         last_event_ = TouchEvent::TAP;
         last_event_us_ = esp_timer_get_time();
-        // Use the IfActive variant so a tap during set_avatar("off") does
-        // not pop the avatar back over the WiFi config / settings screens.
-        SetAvatarExpressionIfActive("surprised");
-        ScheduleIdleRevert();
+        if (touch_reaction_enabled_.load(std::memory_order_acquire)) {
+            // Use the IfActive variant so a tap during set_avatar("off") does
+            // not pop the avatar back over the WiFi config / settings screens.
+            SetAvatarExpressionIfActive("surprised");
+            ScheduleIdleRevert();
+        }
         Application::GetInstance().SendStackChanEvent("touch", "tap", duration_ms);
     }
 
@@ -4317,9 +4328,11 @@ private:
         LogTouchEvent("STROKE", duration_ms);
         last_event_ = TouchEvent::STROKE;
         last_event_us_ = esp_timer_get_time();
-        SetAvatarExpressionIfActive("embarrassed");
-        StartServoWobble();
-        ScheduleIdleRevert();
+        if (touch_reaction_enabled_.load(std::memory_order_acquire)) {
+            SetAvatarExpressionIfActive("embarrassed");
+            StartServoWobble();
+            ScheduleIdleRevert();
+        }
         Application::GetInstance().SendStackChanEvent("touch", "stroke", duration_ms);
     }
 
@@ -4414,8 +4427,11 @@ private:
     void InitializeTouchSettings() {
         Settings settings("touch", false);
         bool enabled = settings.GetBool("enabled", true);
+        bool reaction = settings.GetBool("reaction", true);
         touch_sensor_enabled_.store(enabled, std::memory_order_release);
-        ESP_LOGI(TAG, "Touch sensor setting loaded: enabled=%d", enabled ? 1 : 0);
+        touch_reaction_enabled_.store(reaction, std::memory_order_release);
+        ESP_LOGI(TAG, "Touch sensor setting loaded: enabled=%d reaction=%d",
+                 enabled ? 1 : 0, reaction ? 1 : 0);
     }
 
     void InitializeSi12tTouch() {
@@ -5691,6 +5707,51 @@ private:
                 cJSON* root = cJSON_CreateObject();
                 cJSON_AddBoolToObject(root, "ok", true);
                 cJSON_AddBoolToObject(root, "enabled", enabled);
+                cJSON_AddStringToObject(root, "takes_effect", "immediate");
+                cJSON_AddStringToObject(root, "persistence", "nvs");
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.robot.get_touch_reaction_enabled",
+            "Read the NVS-backed flag for the board's own reaction to a head "
+            "touch: the surprised / embarrassed face, the head wobble on a "
+            "stroke, and the idle face three seconds later. When disabled, "
+            "HandleTap / HandleStroke skip that reaction and still emit the "
+            "stackchan/event. sensor_enabled is the head-touch sensor flag, "
+            "which when false stops the reaction and the event alike.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "enabled",
+                                      touch_reaction_enabled_.load(std::memory_order_acquire));
+                cJSON_AddBoolToObject(root, "sensor_enabled",
+                                      touch_sensor_enabled_.load(std::memory_order_acquire));
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.robot.set_touch_reaction_enabled",
+            "Update the NVS-backed flag for the board's own reaction to a "
+            "head touch. Disabling takes effect immediately and persists "
+            "across reboot; subsequent HandleTap / HandleStroke calls leave "
+            "the face and the head alone (no surprised / embarrassed face, "
+            "no wobble, no return to idle) and still emit the "
+            "stackchan/event, for a host that answers touches itself. A "
+            "wobble already under way finishes; the face it left stays "
+            "until something sets another.",
+            PropertyList({Property("enabled", kPropertyTypeBoolean)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                bool enabled = properties["enabled"].value<bool>();
+                Settings settings("touch", true);
+                settings.SetBool("reaction", enabled);
+                touch_reaction_enabled_.store(enabled, std::memory_order_release);
+
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", true);
+                cJSON_AddBoolToObject(root, "enabled", enabled);
+                cJSON_AddBoolToObject(root, "sensor_enabled",
+                                      touch_sensor_enabled_.load(std::memory_order_acquire));
                 cJSON_AddStringToObject(root, "takes_effect", "immediate");
                 cJSON_AddStringToObject(root, "persistence", "nvs");
                 return root;

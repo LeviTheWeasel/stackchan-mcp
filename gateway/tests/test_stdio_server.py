@@ -348,6 +348,79 @@ async def test_get_touch_sensor_enabled_relays_to_esp32(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_tools_includes_touch_reaction_tools():
+    """The switch for the firmware's own touch reaction is exposed, and says what it leaves on."""
+    server = create_server()
+
+    result = await server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+
+    tools = {tool.name: tool for tool in result.root.tools}
+
+    get_tool = tools["get_touch_reaction_enabled"]
+    assert get_tool.inputSchema == {"type": "object", "properties": {}}
+    assert "NVS" in get_tool.description
+    assert "stackchan/event" in get_tool.description
+
+    set_tool = tools["set_touch_reaction_enabled"]
+    assert set_tool.inputSchema["required"] == ["enabled"]
+    assert set_tool.inputSchema["properties"]["enabled"]["type"] == "boolean"
+    assert "persists across reboot" in set_tool.description
+    # What tells it apart from set_touch_sensor_enabled: the events keep coming.
+    assert "keeps tap/stroke detection" in set_tool.description
+    assert "stackchan/event" in set_tool.description
+
+
+@pytest.mark.asyncio
+async def test_touch_reaction_tools_relay_to_esp32(monkeypatch):
+    """The touch reaction tools map onto the firmware's self.robot.* tools."""
+    calls = []
+    stored = {"enabled": True}
+
+    class FakeESP32:
+        device_connected = True
+
+        async def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            reply = {"sensor_enabled": True}
+            if name == "self.robot.set_touch_reaction_enabled":
+                stored["enabled"] = arguments["enabled"]
+                reply.update(ok=True, takes_effect="immediate", persistence="nvs")
+            reply["enabled"] = stored["enabled"]
+            return {"content": [{"type": "text", "text": json.dumps(reply)}]}, None
+
+    class FakeGateway:
+        esp32 = FakeESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: FakeGateway())
+    server = create_server()
+
+    async def call(name, arguments):
+        result = await server.request_handlers[CallToolRequest](
+            CallToolRequest(method="tools/call", params={"name": name, "arguments": arguments})
+        )
+        return json.loads(result.root.content[0].text)
+
+    switched = await call("set_touch_reaction_enabled", {"enabled": False})
+    # Arguments a reader has no use for are not passed on to the device.
+    read_back = await call("get_touch_reaction_enabled", {"enabled": True})
+
+    assert calls == [
+        ("self.robot.set_touch_reaction_enabled", {"enabled": False}),
+        ("self.robot.get_touch_reaction_enabled", {}),
+    ]
+    assert switched == {
+        "sensor_enabled": True,
+        "ok": True,
+        "takes_effect": "immediate",
+        "persistence": "nvs",
+        "enabled": False,
+    }
+    assert read_back == {"sensor_enabled": True, "enabled": False}
+
+
+@pytest.mark.asyncio
 async def test_list_tools_includes_set_mouth_sequence():
     """set_mouth_sequence is exposed to MCP clients with an array schema."""
     server = create_server()

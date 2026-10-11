@@ -51,6 +51,23 @@ During PMIC ON, holding the head at ~45° by hand while the boot-init climb comp
 | 200 ≤ d < 400 ms | **TAP** | face=`surprised` only |
 | d ≥ 400 ms | **STROKE** | face=`embarrassed` + servo wobble |
 
+Either reaction is followed by face=`idle` after `REACTION_HOLD_MS`, whatever face was showing before the touch. The event is sent to the gateway (`SendStackChanEvent("touch", ...)`) after the reaction has been started.
+
+### Switching the reaction off
+
+Two NVS-backed flags in namespace `touch`, both default on, both taking effect at once:
+
+| Key | Tools | Off means |
+|---|---|---|
+| `enabled` | `self.robot.set_touch_sensor_enabled` / `get_touch_sensor_enabled` | No reaction **and** no `stackchan/event` |
+| `reaction` | `self.robot.set_touch_reaction_enabled` / `get_touch_reaction_enabled` | No face change, no wobble, no revert to `idle`; the gesture is still classified, logged (`touch event:`), kept for `get_touch_state` and sent as `stackchan/event` |
+
+`reaction` is for a host that owns the face (it puts the robot to sleep, plays its own wake-up at a touch): with the reaction on, a touch — a phantom from the charger included — overwrites that face and leaves `idle` behind. Thresholds, debounce and `COOLDOWN_MS` do not depend on either flag.
+
+Switching `reaction` off while a reaction is showing: a wobble already staged runs to its end (it would otherwise leave the head turned), and the pending revert is dropped (`TouchRevertCb` checks the flag), so the reaction face stays until something sets another.
+
+`reaction` was added on 2026-10-11 and built for the stackchan board; it has not been run on a device yet.
+
 ### Touch guidance for hardware testing
 
 - The touch sensor is the **Si12T on the head top** (not the LCD screen FT6336)
@@ -104,7 +121,7 @@ The stackchan board (`class StackChanBoard : public WifiBoard`, `stackchan.cc:49
 |---|---|---|
 | idle / listening | MCP `get_device_status` state field, serial log | LCD avatar (no auto-switch), LED (NoLed) |
 | speaking | Serial log `tts.start`/`tts.stop`, mouth animation | LED |
-| touch reaction | LCD avatar (surprised/embarrassed), serial `touch event:` | LED, MCP state (unchanged) |
+| touch reaction | LCD avatar (surprised/embarrassed; not with the `reaction` flag off, see § 2), serial `touch event:` | LED, MCP state (unchanged) |
 | WS connection | Serial log `WS connected/disconnected`, gateway `/health` | Avatar-covered LCD status |
 
 **Central rule**: deterministic state observation uses **MCP `get_device_status` + serial monitor log**. LCD and LED are supplementary only.

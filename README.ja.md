@@ -55,6 +55,8 @@
 | `get_touch_state` | タッチセンサ状態 (press/release/stroke 等) | ✅ |
 | `get_touch_sensor_enabled` | 頭部タッチ検出が有効かどうかを取得。NVS に保存され、再起動後も維持される | ✅ |
 | `set_touch_sensor_enabled(enabled)` | 頭部タッチ検出を有効/無効化。無効時は firmware 側のローカル動作反応と MCP `stackchan/event` 送信の両方を止め、設定は再起動後も維持される | ✅ |
+| `get_touch_reaction_enabled` | firmware が頭部タッチに自前で反応する (表情変更、stroke 時の首振り、3 秒後の `idle` 復帰) かどうかを取得。NVS に保存され、再起動後も維持される | 🧪 ビルド済み・実機未確認 |
+| `set_touch_reaction_enabled(enabled)` | 頭部タッチに対する firmware 自前の反応を有効/無効化。無効時は表情と首に触れず、tap/stroke 検出と MCP `stackchan/event` 送信は継続するので、ホスト側でタッチに応答できる。デフォルトは有効、設定は再起動後も維持される | 🧪 ビルド済み・実機未確認 |
 | `set_avatar(face)` | アバター表情切替 (`idle` / `happy` / `thinking` / `sad` / `surprised` / `embarrassed` / `sleep` / `yawn` / `doze`)、または `off` でアバターを隠し blink も停止して下層の WiFi 設定 / OTA / 設定画面を露出。他 face を指定するとアバター + blink が復帰 | ✅ |
 | `set_blink(state)` | 瞬き ON/OFF | ✅ |
 | `set_mouth(state)` | 口開閉（one-shot、次の呼び出しまで保持） | ✅ |
@@ -669,6 +671,14 @@ channel に同じイベントが配信されます。連携するホストに合
 
 詳細な注釈付き設定リファレンスは `notify.example.yml` を参照して
 ください。
+
+firmware はイベントを送る前に、タッチに対して自前でも反応します。
+tap では `surprised`、stroke では `embarrassed` と首振り、そして
+3 秒後には直前の表情に関係なく `idle` に戻します。ホスト側でタッチに
+応答する（独自の表情や首の動きを付ける）場合は、
+`set_touch_reaction_enabled(false)` でこの反応だけを止められます。
+イベントは引き続き届きます。設定はデバイスに保存され、デフォルトは
+有効です。
 
 #### Channel: `channels`（Claude Code plugin 経路）
 

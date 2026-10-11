@@ -53,9 +53,21 @@ documented-only.
   connection flags. The id changes on every (re)connection, so a polling
   host can detect a device reboot even when the reconnect lands between
   polls and `connected` never reads false.
+- Added `get_touch_reaction_enabled` and `set_touch_reaction_enabled`,
+  which relay to the firmware tools of the same names (see Firmware).
 
 ### Firmware
 
+- Added `self.robot.set_touch_reaction_enabled` and
+  `self.robot.get_touch_reaction_enabled`: an NVS-backed switch
+  (namespace `touch`, key `reaction`, on by default) for the board's own
+  reaction to a head touch, which is the `surprised` / `embarrassed`
+  face, the head wobble on a stroke and the `idle` face three seconds
+  later. Off, taps and strokes are still detected and still sent as
+  `stackchan/event`, so a host that sets the face itself can answer a
+  touch without the firmware changing the face or moving the head first.
+  `set_touch_sensor_enabled` is unchanged and still stops the events too.
+  Built for the stackchan board; not yet run on a device.
 - Added opt-in, compile-time configurable AXP2101 charge hysteresis for StackChan. The feature is disabled by default; when enabled, startup first allows charging, protection disables it at 70% or above, and charging resumes at 30% or below. An unreadable fuel gauge fails safe to charging enabled. `self.power.set_charge_enabled` and `self.power.get_charge_state` provide manual control and state inspection.
 
 ## [0.17.0] - 2026-07-12

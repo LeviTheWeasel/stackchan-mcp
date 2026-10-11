@@ -1111,6 +1111,14 @@ async def _dispatch_mcp_tool(
             "self.robot.set_touch_sensor_enabled",
             arguments,
         ),
+        "get_touch_reaction_enabled": (
+            "self.robot.get_touch_reaction_enabled",
+            {},
+        ),
+        "set_touch_reaction_enabled": (
+            "self.robot.set_touch_reaction_enabled",
+            arguments,
+        ),
         "set_avatar": (
             "self.display.set_avatar",
             arguments,
@@ -1817,6 +1825,48 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                             "description": (
                                 "True to enable tap/stroke detection; false "
                                 "to disable local reactions and event emission."
+                            ),
+                        },
+                    },
+                    "required": ["enabled"],
+                },
+            ),
+            Tool(
+                name="get_touch_reaction_enabled",
+                description=(
+                    "Read the device's NVS-backed flag for its own reaction "
+                    "to a head touch: the surprised / embarrassed face, the "
+                    "head wobble on a stroke, and the idle face three seconds "
+                    "later. When disabled, taps and strokes are still "
+                    "detected and still arrive as stackchan/event; only the "
+                    "local reaction is skipped. The reply also carries "
+                    "sensor_enabled (see get_touch_sensor_enabled). The "
+                    "setting persists across reboot."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="set_touch_reaction_enabled",
+                description=(
+                    "Switch the device's own reaction to a head touch on or "
+                    "off: the surprised / embarrassed face, the head wobble "
+                    "on a stroke, and the idle face three seconds later. "
+                    "Unlike set_touch_sensor_enabled, disabling this keeps "
+                    "tap/stroke detection and the MCP stackchan/event "
+                    "emission, so a host can answer touches itself without "
+                    "the firmware changing the face or moving the head "
+                    "first. The NVS-backed setting persists across reboot; "
+                    "enabled is the default."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": (
+                                "True for the firmware's own face and wobble "
+                                "at a touch; false to leave the face and the "
+                                "head alone and only send the event."
                             ),
                         },
                     },

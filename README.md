@@ -55,6 +55,8 @@ This repository is a monorepo.
 | `get_touch_state` | Touch sensor state (press / release / stroke / etc.) | ✅ |
 | `get_touch_sensor_enabled` | Read whether head-touch detection is enabled. The NVS-backed setting persists across reboot. | ✅ |
 | `set_touch_sensor_enabled(enabled)` | Enable or disable head-touch detection. Disabling stops both the firmware local motion response and MCP `stackchan/event` emission, and persists across reboot. | ✅ |
+| `get_touch_reaction_enabled` | Read whether the firmware answers a head touch by itself (face change, head wobble on a stroke, `idle` face 3 s later). The NVS-backed setting persists across reboot. | 🧪 built, not yet run on a device |
+| `set_touch_reaction_enabled(enabled)` | Switch the firmware's own reaction to a head touch on or off. Disabling leaves the face and the head alone while tap/stroke detection and MCP `stackchan/event` emission keep working, so a host can answer touches itself. On by default; persists across reboot. | 🧪 built, not yet run on a device |
 | `set_avatar(face)` | Switch avatar expression (`idle` / `happy` / `thinking` / `sad` / `surprised` / `embarrassed` / `sleep` / `yawn` / `doze`), or `off` to hide the avatar and disable blink so the underlying WiFi config / OTA / settings screens are visible. Any other face brings the avatar back and restores blink. | ✅ |
 | `set_blink(state)` | Blink on/off | ✅ |
 | `set_mouth(state)` | Mouth open/close (one-shot, held until next call) | ✅ |
@@ -739,6 +741,14 @@ you are integrating with:
 
 See `notify.example.yml` for the full annotated configuration
 reference.
+
+The firmware also answers a touch by itself, before it sends the
+event: `surprised` on a tap, `embarrassed` and a head wobble on a
+stroke, and three seconds later the `idle` face, whatever was showing
+before. A host that answers touches itself (its own faces, its own
+head movement) can switch that off with
+`set_touch_reaction_enabled(false)`; the events keep arriving. The
+setting is stored on the device and is on by default.
 
 #### Channel: `channels` (Claude Code plugin path)
 
