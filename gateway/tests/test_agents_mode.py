@@ -1146,3 +1146,43 @@ async def test_a_reply_marks_its_own_start_and_end_for_the_levels(
     assert conv._uplink_phase() is None
     monkeypatch.setattr(agents_mode, "UPLINK_LEVEL_TAIL_S", 0.0)
     assert conv._uplink_phase() == "between_replies"
+
+
+def test_reply_gain_is_zero_unless_asked_otherwise_and_never_negative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("STACKCHAN_AGENTS_UPLINK_REPLY_GAIN_DB", raising=False)
+    assert agents_mode.resolve_uplink_reply_gain_db() == 0.0
+    monkeypatch.setenv("STACKCHAN_AGENTS_UPLINK_REPLY_GAIN_DB", "6")
+    assert agents_mode.resolve_uplink_reply_gain_db() == 6.0
+    assert agents_mode.resolve_uplink_reply_gain_db(0) == 0.0
+    for bad in (-1, 25, "loud", True):
+        with pytest.raises(ValueError):
+            agents_mode.resolve_uplink_reply_gain_db(bad)
+
+
+@pytest.mark.asyncio
+async def test_the_extra_gain_applies_only_while_a_reply_is_playing() -> None:
+    conv = AgentsConversation(
+        _FakeGateway(),
+        agent_id="agent_test",
+        api_key="key_test",
+        uplink_gain_db=6.0,
+        uplink_reply_gain_db=14.0,
+    )
+
+    between = await _uplink(conv, [_tone(100)])
+    conv._reply_playing = True
+    during = await _uplink(conv, [_tone(100)])
+    conv._reply_playing = False
+    conv._reply_stopped_at = agents_mode.time.monotonic()
+    after = await _uplink(conv, [_tone(100)])
+
+    assert between[-1] == _tone(200)
+    assert during[-1] == _tone(1000)
+    # The moment a reply stops, ordinary speech is at full level again.
+    assert after[-1] == _tone(200)
+    status = conv.status()
+    assert status["uplink_gain_db"] == 6.0 and status["uplink_reply_gain_db"] == 14.0
+    # Levels are still reported as the device sent them.
+    assert status["uplink_levels"]["while_reply_plays"]["rms"] == 100

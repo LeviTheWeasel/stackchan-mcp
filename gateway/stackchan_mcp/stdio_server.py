@@ -784,6 +784,7 @@ async def _handle_agents_converse_start(
         agent_id=arguments.get("agent_id"),
         listen_mode=arguments.get("listen_mode"),
         uplink_gain_db=arguments.get("uplink_gain_db"),
+        uplink_reply_gain_db=arguments.get("uplink_reply_gain_db"),
     )
     return _follow_pose_text({"ok": True, **status})
 
@@ -2898,6 +2899,21 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                                 "Read uplink_levels in agents_converse_"
                                 "status to choose. Defaults to "
                                 "STACKCHAN_AGENTS_UPLINK_GAIN_DB, then 0."
+                            ),
+                        },
+                        "uplink_reply_gain_db": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 24,
+                            "description": (
+                                "Extra decibels of amplification, on top of "
+                                "uplink_gain_db, applied only while a reply "
+                                "is playing. That is when the guest's voice "
+                                "arrives thinned by the echo canceller, and "
+                                "a gain that would clip ordinary speech "
+                                "between replies is harmless. Defaults to "
+                                "STACKCHAN_AGENTS_UPLINK_REPLY_GAIN_DB, then "
+                                "0."
                             ),
                         },
                     },

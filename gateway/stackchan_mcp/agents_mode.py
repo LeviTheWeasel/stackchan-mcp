@@ -192,6 +192,9 @@ UPLINK_LEVEL_TAIL_S = 0.5
 UPLINK_GAIN_MIN_DB = -12.0
 UPLINK_GAIN_MAX_DB = 30.0
 
+#: Limit for the extra gain applied only while a reply is playing.
+UPLINK_REPLY_GAIN_MAX_DB = 24.0
+
 UPLINK_WHILE_REPLY_PLAYS = "while_reply_plays"
 UPLINK_BETWEEN_REPLIES = "between_replies"
 
@@ -245,6 +248,37 @@ def resolve_uplink_gain_db(explicit: Any = None) -> float:
         raise ValueError(
             f"Uplink gain {raw!r} dB is outside {UPLINK_GAIN_MIN_DB:g}..{UPLINK_GAIN_MAX_DB:g}."
         )
+    return gain
+
+
+def resolve_uplink_reply_gain_db(explicit: Any = None) -> float:
+    """Extra amplification of the microphone audio for as long as a reply is playing.
+
+    An explicit value wins, then ``STACKCHAN_AGENTS_UPLINK_REPLY_GAIN_DB``,
+    then 0. It is added to the uplink gain.
+
+    The two halves of a conversation need different amounts. Between replies
+    the guest's voice arrives at full level, and a gain large enough to lift
+    a voice the canceller has thinned would drive it into clipping (seen at
+    12 dB already: a few hundred clipped samples per call). While a reply
+    plays there is only the leftover echo and whatever of the guest's voice
+    got through, both far below full scale. With one gain for both, a guest
+    was heard talking over four replies one evening and not at all over one
+    the next morning.
+    """
+    raw: Any = explicit
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = os.getenv("STACKCHAN_AGENTS_UPLINK_REPLY_GAIN_DB", "")
+    if isinstance(raw, str) and not raw.strip():
+        return 0.0
+    try:
+        if isinstance(raw, bool):
+            raise ValueError
+        gain = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"Uplink reply gain {raw!r} is not a number of decibels.") from None
+    if not math.isfinite(gain) or not (0.0 <= gain <= UPLINK_REPLY_GAIN_MAX_DB):
+        raise ValueError(f"Uplink reply gain {raw!r} dB is outside 0..{UPLINK_REPLY_GAIN_MAX_DB:g}.")
     return gain
 
 
@@ -376,6 +410,7 @@ class AgentsConversation:
         api_key: str,
         listen_mode: str = LISTEN_MODE_MANUAL,
         uplink_gain_db: float = 0.0,
+        uplink_reply_gain_db: float = 0.0,
     ) -> None:
         self._gateway = gateway
         self._agent_id = agent_id
@@ -383,6 +418,8 @@ class AgentsConversation:
         self._listen_mode = listen_mode
         self._uplink_gain_db = uplink_gain_db
         self._uplink_factor = 10.0 ** (uplink_gain_db / 20.0)
+        self._uplink_reply_gain_db = uplink_reply_gain_db
+        self._uplink_reply_factor = 10.0 ** ((uplink_gain_db + uplink_reply_gain_db) / 20.0)
         self._uplink_levels = UplinkLevels()
         self._uplink_clipped_samples = 0
         # Whether a reply is being fed to the speaker, and when the last
@@ -455,6 +492,8 @@ class AgentsConversation:
             # ``frames_uplinked`` does.
             "uplink_levels": self._uplink_levels.report(),
             "uplink_gain_db": self._uplink_gain_db,
+            # Added to it for as long as a reply is playing.
+            "uplink_reply_gain_db": self._uplink_reply_gain_db,
             "uplink_clipped_samples": self._uplink_clipped_samples,
             "audio_chunks_received": self._audio_chunks_received,
             "interruptions": self._interruptions,
@@ -738,7 +777,8 @@ class AgentsConversation:
                 continue
             if not pcm:
                 continue
-            pcm, energy, samples, clipped = measure_and_amplify(pcm, self._uplink_factor)
+            factor = self._uplink_reply_factor if self._reply_playing else self._uplink_factor
+            pcm, energy, samples, clipped = measure_and_amplify(pcm, factor)
             self._uplink_levels.note(self._uplink_phase(), energy, samples)
             self._uplink_clipped_samples += clipped
             payload = json.dumps(
@@ -1088,6 +1128,7 @@ async def start_agents_conversation(
     agent_id: Any = None,
     listen_mode: Any = None,
     uplink_gain_db: Any = None,
+    uplink_reply_gain_db: Any = None,
 ) -> dict[str, Any]:
     global _mode
     async with _get_mode_lock():
@@ -1099,6 +1140,7 @@ async def start_agents_conversation(
             api_key=resolve_api_key(),
             listen_mode=resolve_listen_mode(listen_mode),
             uplink_gain_db=resolve_uplink_gain_db(uplink_gain_db),
+            uplink_reply_gain_db=resolve_uplink_reply_gain_db(uplink_reply_gain_db),
         )
         _mode = mode
         try:
